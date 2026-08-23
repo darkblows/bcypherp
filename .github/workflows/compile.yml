@@ -82,9 +82,9 @@ jobs:
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: latest
-        name: "BastetCypher - Ultima Versione"
-        body: "Compilazione automatica dell'ultimo aggiornamento."
+        tag_name: autopublished
+        name: "BastetCypher - Autopublished"
+        body: "Automatically populate the latest update."
         files: artifacts/*
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
