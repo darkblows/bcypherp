@@ -42,10 +42,10 @@ jobs:
     - name: Compile with PyInstaller
       run: pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
 
-    # Passaggio speciale: Trasforma il binario Linux in una vera AppImage
     - name: Build AppImage (Linux only)
       if: matrix.os == 'ubuntu-22.04'
       run: |
+        sudo apt-get update && sudo apt-get install -y squashfs-tools file
         mkdir -p AppDir/usr/bin
         cp dist/bastetcypher AppDir/usr/bin/bastetcypher
         cp icon.png AppDir/bastetcypher.png
