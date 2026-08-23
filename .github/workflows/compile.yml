@@ -1,8 +1,12 @@
-name: Compile with PyInstaller
+name: Compile & Release
 
 on:
   push:
     branches: [ "main" ]
+
+# Permette a GitHub Actions di creare la Release pubblica
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -11,10 +15,13 @@ jobs:
         include:
           - os: ubuntu-latest
             icon: icon.png
+            suffix: linux
           - os: macos-latest
             icon: icon.png
+            suffix: macos
           - os: windows-latest
             icon: icon.ico
+            suffix: windows
 
     runs-on: ${{ matrix.os }}
 
@@ -36,8 +43,41 @@ jobs:
     - name: Compile with PyInstaller
       run: pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
 
+    - name: Rename executables
+      shell: bash
+      run: |
+        cd dist
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          mv bastetcypher.exe bastetcypher-windows.exe
+        elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+          mv bastetcypher bastetcypher-macos
+        else
+          mv bastetcypher bastetcypher-linux
+        fi
+
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: bastetcypher-${{ matrix.os }}
+        name: bastetcypher-${{ matrix.suffix }}
         path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        pattern: bastetcypher-*
+        merge-multiple: true
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: latest
+        name: "BastetCypher - Ultima Versione"
+        body: "Compilazione automatica dell'ultimo aggiornamento."
+        files: artifacts/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
