@@ -1,0 +1,116 @@
+================================================================================
+BastetCypher - Technical Notes, Build Architecture & Security Profile
+================================================================================
+
+1. ARCHITECTURAL TRANSITION & SECURITY MODEL
+--------------------------------------------------------------------------------
+- Web-to-Desktop Migration:
+  Transitioned from a web-based architecture to a native desktop application. 
+  This design completely eliminates browser-specific attack vectors, such as:
+    * Malicious browser extensions (DOM tampering and active keylogging).
+    * Cross-Site Scripting (XSS) and Session Hijacking.
+    * Insecure storage risks (e.g., LocalStorage or SessionStorage scraping).
+    * Man-in-the-Middle (MITM) and DNS poisoning risks during execution.
+
+- Memory Safety:
+  Built with Python, a memory-safe language. The runtime natively mitigates 
+  classic low-level memory vulnerabilities such as buffer overflows, double-free 
+  errors, and dangling pointers.
+
+- Principle of Least Privilege:
+  The application is strictly designed to run as an unprivileged user process 
+  without requiring root/administrator permissions.
+    * Prevents unauthorized modifications to system directories (/etc, /usr/bin).
+    * Limits potential compromise impact strictly to the unprivileged user scope.
+    * Preserves system-level sandboxing integrity.
+
+- Secure Coding Practices:
+  Avoids dynamic evaluation constructs (e.g., `eval()`, `exec()`) and unsafe 
+  system calls (`subprocess` with `shell=True`) to prevent code injection.
+
+
+2. DISPLAY PROTECTION & SCREEN CAPTURE MITIGATION
+--------------------------------------------------------------------------------
+- Linux Isolation (Wayland vs. X11):
+  * Legacy X11 allows any process to capture display pixels and record global 
+    keystrokes without restrictions.
+  * Wayland enforces strict compositor-level window isolation:
+      - Global keylogging is blocked by design.
+      - Display buffers are isolated per window.
+      - Screen capture/sharing requires explicit user authorization via 
+        XDG Desktop Portals and PipeWire.
+
+- Windows Anti-Capture:
+  Can be protected via Windows API integration using `SetWindowDisplayAffinity` 
+  with `WDA_EXCLUDEFROMCAPTURE` (0x00000011), rendering the application window 
+  black in screenshot tools, remote access tools (RATs), and screen recorders.
+
+- macOS Anti-Capture:
+  Can be protected via Quartz window sharing settings (`NSWindow.sharingType = .none`).
+
+
+3. LINUX COMPILATION, APPIMAGE ISSUES & GLIB RESOLUTION
+--------------------------------------------------------------------------------
+- AppImage Packaging Failures:
+  Initial AppImage packaging via `appimagetool` on GitHub Actions failed due to 
+  missing build tools (`squashfs-tools`, `file`) and runtime FUSE dependencies 
+  (`libfuse2` missing on Ubuntu 22.04+ runners).
+
+- Symbol Lookup Error (`g_dir_unref`):
+  Standalone PyInstaller builds on `ubuntu-22.04` bundled host GLib libraries 
+  (`libglib-2.0.so`, `libgobject-2.0.so`, etc.). Running the executable on 
+  newer Linux environments (e.g., Kubuntu with GLib 2.80+) caused runtime 
+  symbol lookup errors due to mismatches between bundled GLib binaries and the 
+  host's native display server drivers.
+
+- The GLib Filtering Solution:
+  To achieve universal Linux compatibility without AppImage overhead, the build 
+  pipeline modifies the PyInstaller `.spec` file dynamically to filter out GLib 
+  shared objects from the bundled binary payload:
+    glib_libs = ["libglib-2.0.so", "libgobject-2.0.so", "libgio-2.0.so", "libgmodule-2.0.so"]
+    a.binaries = [x for x in a.binaries if not any(lib in x[0] for lib in glib_libs)]
+  This forces the binary to link against the target host's native GLib runtime, 
+  resolving symbol lookup errors across both legacy (Ubuntu 22.04) and rolling 
+  modern distributions.
+
+
+4. OS CODE SIGNING & EXECUTION BYPASS PROCEDURES
+--------------------------------------------------------------------------------
+- Linux:
+  Does not require cryptographic signing. Execution requires only file permissions:
+  $ chmod +x ./bastetcypher-linux
+
+- Windows:
+  Unsigned `.exe` binaries trigger Windows Defender SmartScreen ("Unknown Publisher").
+  User Bypass: Click "More info" -> "Run anyway". SmartScreen remembers the decision 
+  for subsequent launches.
+
+- macOS:
+  Unsigned binaries trigger strict Gatekeeper quarantine checks.
+  User Bypass Methods:
+    1. Right-click (or Ctrl+Click) the file -> Select "Open" -> Confirm "Open".
+    2. Navigate to System Settings -> Privacy & Security -> Security -> Click "Open Anyway".
+    3. Terminal override (removes quarantine attribute):
+       $ xattr -d com.apple.quarantine ./bastetcypher-macos
+
+
+5. CI/CD PIPELINE & AUTOMATED RELEASES
+--------------------------------------------------------------------------------
+- Multi-Platform Build Matrix:
+  GitHub Actions workflow (`.github/workflows/compile.yml`) compiles binaries 
+  simultaneously across three operating system runners:
+    * Linux: `ubuntu-22.04` (Python 3.11)
+    * macOS: `macos-latest` (Python 3.11)
+    * Windows: `windows-latest` (Python 3.11)
+
+- Dependency Management:
+  Every pipeline run updates `pip`, installs core packaging tools (`pyinstaller`, 
+  `pillow`), and resolves `requirements.txt` to automatically pull upstream security 
+  patches into builds.
+
+- Automated Release Lifecycle:
+  Triggers automatically on every push to the `main` branch. Artifacts are 
+  collected across all matrix jobs and published under a single rolling 
+  release tag (`autopublished`), ensuring updated binaries without cluttering 
+  the repository release history.
+================================================================================
