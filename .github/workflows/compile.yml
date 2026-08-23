@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "main" ]
 
-# Permette a GitHub Actions di creare la Release pubblica
 permissions:
   contents: write
 
@@ -13,7 +12,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             icon: icon.png
             suffix: linux
           - os: macos-latest
@@ -43,7 +42,28 @@ jobs:
     - name: Compile with PyInstaller
       run: pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
 
-    - name: Rename executables
+    # Passaggio speciale: Trasforma il binario Linux in una vera AppImage
+    - name: Build AppImage (Linux only)
+      if: matrix.os == 'ubuntu-22.04'
+      run: |
+        mkdir -p AppDir/usr/bin
+        cp dist/bastetcypher AppDir/usr/bin/bastetcypher
+        cp icon.png AppDir/bastetcypher.png
+        
+        echo "[Desktop Entry]" > AppDir/bastetcypher.desktop
+        echo "Name=BastetCypher" >> AppDir/bastetcypher.desktop
+        echo "Exec=bastetcypher" >> AppDir/bastetcypher.desktop
+        echo "Icon=bastetcypher" >> AppDir/bastetcypher.desktop
+        echo "Type=Application" >> AppDir/bastetcypher.desktop
+        echo "Categories=Utility;" >> AppDir/bastetcypher.desktop
+        
+        wget https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
+        chmod +x appimagetool-x86_64.AppImage
+        ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir dist/bastetcypher-linux.AppImage
+        
+        rm dist/bastetcypher
+
+    - name: Rename executables (Windows & Mac)
       shell: bash
       run: |
         cd dist
@@ -51,8 +71,6 @@ jobs:
           mv bastetcypher.exe bastetcypher-windows.exe
         elif [ "${{ matrix.os }}" = "macos-latest" ]; then
           mv bastetcypher bastetcypher-macos
-        else
-          mv bastetcypher bastetcypher-linux
         fi
 
     - name: Upload Artifact
