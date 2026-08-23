@@ -1,0 +1,6 @@
+customtkinter>=5.2.2
+cryptography>=42.0.0
+pillow>=10.3.0
+pymupdf>=1.24.0
+mutagen>=1.47.0
+pygame>=2.6.0
