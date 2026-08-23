@@ -40,7 +40,15 @@ jobs:
         pip install -r requirements.txt
 
     - name: Compile with PyInstaller
-      run: pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
+      shell: bash
+      run: |
+        if [ "${{ matrix.os }}" = "ubuntu-22.04" ]; then
+          pyi-makespec --onefile --icon=${{ matrix.icon }} bastetcypher.py
+          python3 -c "s = open('bastetcypher.spec').read(); fix = '\nglib_libs = [\"libglib-2.0.so\", \"libgobject-2.0.so\", \"libgio-2.0.so\", \"libgmodule-2.0.so\"]\na.binaries = [x for x in a.binaries if not any(lib in x[0] for lib in glib_libs)]\n'; open('bastetcypher.spec', 'w').write(s.replace('pyz = PYZ', fix + 'pyz = PYZ'))"
+          pyinstaller bastetcypher.spec
+        else
+          pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
+        fi
 
     - name: Rename executables
       shell: bash
