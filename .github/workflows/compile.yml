@@ -12,9 +12,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
-            icon: icon.png
-            suffix: linux
           - os: macos-latest
             icon: icon.png
             suffix: macos
@@ -42,13 +39,7 @@ jobs:
     - name: Compile with PyInstaller
       shell: bash
       run: |
-        if [ "${{ matrix.os }}" = "ubuntu-22.04" ]; then
-          pyi-makespec --onefile --icon=${{ matrix.icon }} bastetcypher.py
-          python3 -c "s = open('bastetcypher.spec').read(); fix = '\nglib_libs = [\"libglib-2.0.so\", \"libgobject-2.0.so\", \"libgio-2.0.so\", \"libgmodule-2.0.so\"]\na.binaries = [x for x in a.binaries if not any(lib in x[0] for lib in glib_libs)]\n'; open('bastetcypher.spec', 'w').write(s.replace('pyz = PYZ', fix + 'pyz = PYZ'))"
-          pyinstaller bastetcypher.spec
-        else
-          pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
-        fi
+        pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
 
     - name: Rename executables
       shell: bash
@@ -58,8 +49,6 @@ jobs:
           mv bastetcypher.exe bastetcypher-windows.exe
         elif [ "${{ matrix.os }}" = "macos-latest" ]; then
           mv bastetcypher bastetcypher-macos
-        else
-          mv bastetcypher bastetcypher-linux
         fi
 
     - name: Upload Artifact
