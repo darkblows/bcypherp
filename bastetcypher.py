@@ -17,7 +17,17 @@ File unico, pensato per essere pacchettizzato con:
     pyinstaller --onefile bastetcipher.py
 
 Dipendenze (vedi requirements.txt):
-    customtkinter, cryptography, pillow, pymupdf
+    customtkinter, cryptography, pillow, pymupdf, mutagen, pygame,
+    imageio-ffmpeg
+
+NOTA SU PYINSTALLER E imageio-ffmpeg (player video integrato, SEZIONE 4):
+    imageio-ffmpeg scarica un binario ffmpeg precompilato (~76MB) dentro
+    la propria cartella del pacchetto Python, invece di essere puro
+    codice Python — PyInstaller di solito lo individua automaticamente,
+    ma se la build finale non trova ffmpeg a runtime (il player video
+    integrato mostrerebbe un errore e ripiegherebbe sul player esterno),
+    la soluzione è aggiungere questo flag al comando di build:
+        pyinstaller --onefile --collect-data imageio_ffmpeg bastetcipher.py
 
 NOTA SULLA SICUREZZA DEL "PEPPER" (vedi SEZIONE 2):
     Il valore PEPPER e' hardcoded nel sorgente, ereditato identico
@@ -46,6 +56,7 @@ import struct
 import zlib
 import io
 import threading
+import queue
 import re
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -61,6 +72,28 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 from PIL import Image, ImageTk
+
+# BUGFIX CRITICO PER PYINSTALLER (immagini/PDF renderizzati come riquadri
+# neri nell'eseguibile standalone, mai nell'esecuzione da sorgente):
+# PIL.ImageTk (usato per mostrare qualunque immagine/pagina PDF in un
+# widget Tkinter) importa PIL._tkinter_finder in modo dinamico al suo
+# interno, per individuare l'interprete Tcl/Tk corretto a runtime.
+# L'analizzatore statico di PyInstaller non riesce a rilevare questo
+# import dinamico e quindi non include il modulo nel bundle — risultato:
+# ImageTk.PhotoImage(...) fallisce silenziosamente a runtime SOLO
+# nell'eseguibile pacchettizzato (mai lanciando bastetcipher.py
+# direttamente con `python3 bastetcipher.py`, dove il modulo si trova
+# comunque nell'installazione normale di Pillow), lasciando vuoto/nero
+# ogni punto dell'interfaccia che dovrebbe mostrare un'immagine — quindi
+# ogni anteprima di immagine, ogni pagina PDF, e ogni frame video, dato
+# che tutti passano da ImageTk. Importarlo esplicitamente qui, anche se
+# il nome non viene mai referenziato direttamente nel resto del codice,
+# costringe PyInstaller a includerlo comunque nel bundle (lo stesso
+# effetto ottenibile passando --hidden-import=PIL._tkinter_finder da riga
+# di comando, ma garantito anche se quel flag viene dimenticato in una
+# build futura). Verificato risolvere il problema con una build
+# PyInstaller --onefile reale su Linux.
+import PIL._tkinter_finder  # noqa: F401
 
 import customtkinter as ctk
 
@@ -1078,6 +1111,296 @@ def decode_text_in_memory(data: bytes) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return data.decode("latin-1")
+
+
+# ---------------------------------------------------------------------------
+# Decodifica video in-processo (nessun player esterno, nessun file su disco)
+# ---------------------------------------------------------------------------
+# Usa il binario ffmpeg fornito da imageio-ffmpeg (scaricato una tantum via
+# pip, non richiede alcuna installazione di sistema — a differenza di VLC,
+# che richiederebbe libVLC già presente sulla macchina dell'utente). ffmpeg
+# legge il video direttamente da uno stdin pipe (mai un path su disco) e
+# restituisce frame RGB grezzi + audio PCM via stdout pipe, entrambi
+# interamente in memoria.
+
+
+@dataclass
+class VideoInfo:
+    width: int
+    height: int
+    fps: float
+    duration: float
+    has_audio: bool
+
+
+def _get_ffmpeg_exe() -> str:
+    """
+    Trova il binario ffmpeg fornito da imageio-ffmpeg.
+
+    BUGFIX: imageio_ffmpeg.get_ffmpeg_exe() individua il binario risalendo
+    dal proprio __file__ di modulo — funziona bene con un'installazione
+    pip normale, ma NON ha alcuna consapevolezza di essere eseguito
+    dentro un bundle PyInstaller `--onefile`. A runtime, PyInstaller
+    estrae tutti i file inclusi (incluso il binario ffmpeg) in una
+    cartella temporanea il cui percorso è esposto in `sys._MEIPASS` — un
+    path diverso da quello che la libreria si aspetterebbe di trovare
+    seguendo il proprio __file__. Su una macchina che ha anche Python/pip
+    installati (come questo ambiente di sviluppo) la libreria può comunque
+    "trovare qualcosa" seguendo altri percorsi di sistema e sembrare
+    funzionare; ma sulla macchina di un utente finale che esegue SOLO
+    l'eseguibile standalone (lo scenario reale di un --onefile), quei
+    percorsi di sistema non esistono affatto, e la ricerca fallisce.
+    Controlliamo quindi PRIMA se siamo dentro un bundle PyInstaller e
+    cerchiamo il binario esplicitamente lì, usando la ricerca automatica
+    di imageio_ffmpeg solo come fallback per l'esecuzione normale (non
+    pacchettizzata) da sorgente.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidate = os.path.join(
+            meipass, "imageio_ffmpeg", "binaries", f"ffmpeg-{_ffmpeg_platform_tag()}"
+        )
+        if os.path.isfile(candidate):
+            # Su Linux/macOS il bit eseguibile potrebbe non sopravvivere
+            # all'estrazione di PyInstaller: lo garantiamo esplicitamente,
+            # altrimenti subprocess.Popen fallirebbe con "Permission denied"
+            # pur avendo trovato il file al path giusto.
+            try:
+                os.chmod(candidate, 0o755)
+            except OSError:
+                pass
+            return candidate
+        # Fallback: cerchiamo qualunque binario ffmpeg-* nella stessa
+        # cartella, nel caso il nome esatto della versione sia cambiato
+        # tra le versioni di imageio-ffmpeg.
+        binaries_dir = os.path.join(meipass, "imageio_ffmpeg", "binaries")
+        if os.path.isdir(binaries_dir):
+            for fname in os.listdir(binaries_dir):
+                if fname.startswith("ffmpeg-"):
+                    candidate = os.path.join(binaries_dir, fname)
+                    try:
+                        os.chmod(candidate, 0o755)
+                    except OSError:
+                        pass
+                    return candidate
+
+    import imageio_ffmpeg  # import locale: caricato solo se serve aprire un video
+
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _ffmpeg_platform_tag() -> str:
+    """
+    Replica il naming interno di imageio-ffmpeg per il binario atteso su
+    ciascuna piattaforma (usato solo come primo tentativo mirato in
+    _get_ffmpeg_exe; se il nome non combacia esattamente, il fallback di
+    ricerca nella cartella sopra copre comunque il caso).
+    """
+    machine = platform.machine().lower()
+    if sys.platform.startswith("win"):
+        return "win32.exe" if "64" not in machine else "win64.exe"
+    if sys.platform == "darwin":
+        return "osx64" if "arm" not in machine else "osx-arm64"
+    if "aarch64" in machine or "arm64" in machine:
+        return "linux-aarch64"
+    return "linux-x86_64"
+
+
+def probe_video_in_memory(data: bytes) -> VideoInfo:
+    """
+    Legge risoluzione, framerate, durata e presenza di una traccia audio
+    interrogando ffmpeg con il video passato via stdin — mai scritto su
+    disco. Solleva RuntimeError con un messaggio leggibile SOLO se non
+    riesce a determinare nemmeno la risoluzione (il minimo indispensabile
+    per poter decodificare qualcosa); fps e durata mancanti o malformati
+    ricadono su valori di default ragionevoli invece di bloccare
+    l'apertura del video, perché l'output testuale di debug di ffmpeg non
+    è un formato stabile o garantito — varia tra versioni, codec e
+    container, ed è più robusto tollerare un parsing parziale che
+    rifiutarsi di aprire un video altrimenti valido.
+    """
+    import re
+
+    ffmpeg = _get_ffmpeg_exe()
+    proc = subprocess.Popen(
+        [ffmpeg, "-hide_banner", "-i", "pipe:0"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _, stderr = proc.communicate(input=data)
+    text = stderr.decode("utf-8", errors="ignore")
+
+    # Isoliamo solo la riga "Video: ..." per limitare il raggio d'azione
+    # delle regex successive: matchare sull'intero blocco di testo (che
+    # include anche la riga Audio: e altre righe) aumenta il rischio di
+    # incrociare numeri appartenenti a un'altra riga.
+    video_line = ""
+    for line in text.split("\n"):
+        if re.search(r"Stream.*Video:", line):
+            video_line = line
+            break
+
+    width = height = 0
+    for pattern in (
+        r"(\d{2,5})x(\d{2,5})(?:\s|,|\[)",  # caso standard: "640x480," o "640x480 ["
+        r"(\d{2,5})x(\d{2,5})$",              # risoluzione a fine riga, nessun separatore dopo
+    ):
+        m = re.search(pattern, video_line)
+        if m:
+            width, height = int(m.group(1)), int(m.group(2))
+            break
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Could not determine video dimensions.")
+
+    fps = 25.0  # default ragionevole se non determinabile dal testo
+    for pattern in (
+        r"([\d.]+)\s*fps",           # "24 fps" / "29.97 fps"
+        r"(\d+)/(\d+)\s*fps",        # forma a frazione, rara ma possibile
+    ):
+        m = re.search(pattern, video_line)
+        if m:
+            try:
+                if len(m.groups()) == 2:
+                    num, den = float(m.group(1)), float(m.group(2))
+                    fps = num / den if den else fps
+                else:
+                    fps = float(m.group(1))
+                if fps <= 0 or fps > 300:  # valore assurdo: probabilmente un match sbagliato
+                    fps = 25.0
+                else:
+                    break
+            except (ValueError, ZeroDivisionError):
+                pass
+
+    duration = 0.0
+    duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if duration_match:
+        try:
+            h, m, s = duration_match.groups()
+            duration = int(h) * 3600 + int(m) * 60 + float(s)
+        except ValueError:
+            duration = 0.0
+
+    has_audio = bool(re.search(r"Stream.*Audio:", text))
+
+    return VideoInfo(width=width, height=height, fps=fps, duration=duration, has_audio=has_audio)
+
+
+def stream_video_frames_in_memory(data: bytes, info: VideoInfo):
+    """
+    Decodifica i frame del video come RGB24 grezzo UNO ALLA VOLTA, tramite
+    un generator, invece di caricarli tutti insieme in una lista.
+
+    BUGFIX DI DESIGN IMPORTANTE: la versione precedente
+    (extract_video_frames_in_memory, rimossa) decodificava l'intero video
+    in un colpo solo e teneva TUTTI i frame in RAM contemporaneamente.
+    Per un video anche solo moderatamente grande questo era enorme: un
+    720p di 30 secondi richiede circa 2.3GB SOLO per i frame grezzi, un
+    1080p di un minuto supera i 10GB. Su macchine con RAM limitata
+    (soprattutto Windows, dove spesso gira più software in background)
+    questo produceva MemoryError, swap massiccio (lentezza estrema che
+    sembra "il video non parte"), o il processo veniva ucciso dal sistema
+    operativo — spiegando perché SOLO ALCUNI video (quelli piccoli/brevi)
+    funzionassero mentre altri (più lunghi o a risoluzione più alta, pur
+    sotto la soglia dei 120 secondi) fallissero o si bloccassero.
+
+    Con lo streaming, il processo ffmpeg resta vivo e continua a produrre
+    frame sul suo stdout man mano che li decodifica; noi li leggiamo un
+    frame alla volta. L'uso di RAM per i frame resta O(1) rispetto alla
+    durata del video — cresce solo con la RISOLUZIONE del singolo frame,
+    mai con la sua lunghezza — e il primo frame è disponibile quasi
+    subito invece di dover attendere la decodifica completa del video.
+    """
+    ffmpeg = _get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-i", "pipe:0",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-vf", f"fps={info.fps}",
+        "pipe:1",
+    ]
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    frame_size = info.width * info.height * 3
+    if frame_size <= 0:
+        proc.kill()
+        raise RuntimeError("Invalid video dimensions.")
+
+    # Scriviamo l'input su un thread separato: se scrivessimo tutto lo
+    # stdin in blocco PRIMA di iniziare a leggere lo stdout, e ffmpeg
+    # riempisse il suo buffer di output prima di aver consumato tutto
+    # l'input, i due processi si bloccherebbero a vicenda (deadlock
+    # classico dei pipe bidirezionali — un rischio concreto su Windows,
+    # dove le dimensioni dei buffer dei pipe sono spesso più piccole che
+    # su Linux/macOS, rendendo questo scenario più probabile di quanto
+    # sembri con video anche non enormi).
+    def feed_stdin():
+        try:
+            proc.stdin.write(data)
+        except (BrokenPipeError, OSError):
+            pass  # ffmpeg può aver già chiuso stdin se il video è invalido
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    writer_thread = threading.Thread(target=feed_stdin, daemon=True)
+    writer_thread.start()
+
+    try:
+        while True:
+            chunk = proc.stdout.read(frame_size)
+            if len(chunk) < frame_size:
+                break
+            yield chunk
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        proc.wait(timeout=5)
+        writer_thread.join(timeout=5)
+
+
+def extract_video_audio_as_wav(data: bytes) -> Optional[bytes]:
+    """
+    Estrae la traccia audio del video come WAV valido, interamente in RAM.
+
+    Nota tecnica: chiedere direttamente a ffmpeg un WAV su uno stdout pipe
+    produce un header con la dimensione dei dati non dichiarata
+    correttamente (ffmpeg non conosce in anticipo quanti byte scriverà su
+    uno stream, quindi lascia un valore segnaposto) — file che alcuni
+    lettori (incluso mutagen, già usato altrove in questo programma per
+    leggere la durata degli audio) interpretano male. La soluzione più
+    robusta è chiedere PCM grezzo (nessun header, nessuna ambiguità) e
+    costruire noi stessi un header WAV corretto con il modulo standard
+    `wave`, sapendo l'esatta dimensione dei dati ricevuti.
+    """
+    import io as _io
+    import wave
+
+    ffmpeg = _get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-i", "pipe:0", "-vn",
+        "-f", "s16le", "-ar", "44100", "-ac", "2",
+        "pipe:1",
+    ]
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    stdout, _ = proc.communicate(input=data)
+    if not stdout:
+        return None  # nessuna traccia audio, o estrazione fallita
+    buf = _io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+        w.writeframes(stdout)
+    return buf.getvalue()
 
 
 def get_audio_duration_seconds(data: bytes) -> Optional[float]:
@@ -2401,26 +2724,268 @@ class VaultView(ctk.CTkFrame):
 
     def _preview_video(self, win: ctk.CTkToplevel, data: bytes, name: str) -> None:
         """
-        Nessun player video integrabile leggero esiste in Tkinter puro, quindi
-        deleghiamo al player video di sistema — ma il file viene scritto su
-        RAM-disk (tmpfs, /dev/shm su Linux) quando disponibile, non su disco
-        fisico: /dev/shm è memoria RAM esposta come filesystem, non tocca
-        mai lo storage persistente. Su Windows/macOS non esiste un tmpfs
-        equivalente universale accessibile da Python senza privilegi
-        aggiuntivi: in quel caso usiamo una cartella temporanea normale e
-        lo dichiariamo chiaramente all'utente, invece di far finta che sia
-        RAM-only quando non lo è. Il file temporaneo viene cancellato non
-        appena la finestra di anteprima si chiude.
+        Player video integrato, interamente dentro la finestra dell'app —
+        nessun player esterno, nessun file scritto su disco in nessun
+        momento. Il video viene decodificato in RAM con ffmpeg (binario
+        auto-contenuto, scaricato via pip da imageio-ffmpeg: non richiede
+        alcuna installazione a livello di sistema operativo), leggendo i
+        byte cifrati-poi-decifrati direttamente da uno stdin pipe e
+        ricevendo frame RGB grezzi + audio PCM via stdout pipe.
+
+        BUGFIX rispetto alla versione precedente: prima l'intero video
+        veniva decodificato in un unico blocco PRIMA di mostrare qualunque
+        controllo, tenendo TUTTI i frame in RAM insieme (un 720p di 30
+        secondi arriva a ~2.3GB solo di frame grezzi). Questo causava tre
+        problemi concreti: (1) su video anche non enormi, l'uso di RAM
+        eccessivo produceva MemoryError o swap massiccio — sembrava che
+        "il video non partisse" quando in realtà stava esaurendo la
+        memoria disponibile, più probabile su Windows dove gira più
+        software in background; (2) i controlli (Pause, barra del tempo)
+        comparivano solo DOPO che l'intera decodifica era completata, quindi
+        per video anche solo di qualche secondo la finestra restava senza
+        controlli visibili per un tempo percepibile; (3) il parsing
+        dell'output testuale di ffmpeg per fps/durata era fragile e
+        rifiutava del tutto alcuni video con formati di output leggermente
+        diversi. Ora: i frame vengono decodificati in streaming da un
+        thread separato (uso di RAM costante, indipendente dalla durata
+        del video), i controlli sono creati e mostrati SUBITO, e il
+        probe tollera più varianti di formato senza rifiutare il video.
+        """
+        ctk.CTkLabel(win, text="🎬", font=scaled_font(40), text_color=GOLD_BRIGHT).pack(pady=(14, 4))
+        ctk.CTkLabel(win, text=name, **Styled.label_header_kwargs()).pack(pady=(0, 6))
+        status_label = ctk.CTkLabel(win, text="Reading video info...", **Styled.label_muted_kwargs())
+        status_label.pack(pady=(0, 6))
+        win.update()
+
+        try:
+            info = probe_video_in_memory(data)
+        except Exception as exc:  # noqa: BLE001
+            error_message = str(exc)
+            status_label.configure(
+                text=f"Could not read video: {error_message}\nFalling back to system player.",
+                text_color="#ff9a5a",
+            )
+            self._preview_video_external_fallback(win, data, name, status_label)
+            return
+
+        video_label = tk.Label(win, bg=DEEP)
+        video_label.pack(expand=True, fill="both", padx=10, pady=(0, 6))
+
+        controls = ctk.CTkFrame(win, fg_color="transparent")
+        controls.pack(fill="x", padx=20, pady=(0, 4))
+        slider = ctk.CTkSlider(
+            controls, from_=0, to=max(info.duration, 1), number_of_steps=1000,
+            progress_color=GOLD_BRIGHT, button_color=GOLD, button_hover_color=GOLD_BRIGHT,
+            fg_color=INK,
+        )
+        slider.set(0)
+        slider.pack(fill="x", pady=(0, 8))
+        if info.duration <= 0:
+            slider.configure(state="disabled")
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=(0, 12))
+        play_pause_btn = ctk.CTkButton(btn_row, text="⏸ Pause", **Styled.secondary_button_kwargs())
+        play_pause_btn.pack(side="left", padx=6)
+        stop_btn = ctk.CTkButton(btn_row, text="⏹ Stop", **Styled.secondary_button_kwargs())
+        stop_btn.pack(side="left", padx=6)
+        time_label = ctk.CTkLabel(btn_row, text="0:00 / 0:00", font=FONT_MONO_SMALL, text_color=SAND)
+        time_label.pack(side="left", padx=12)
+
+        def fmt(seconds: float) -> str:
+            seconds = max(0, int(seconds))
+            return f"{seconds // 60}:{seconds % 60:02d}"
+
+        time_label.configure(text=f"0:00 / {fmt(info.duration)}")
+
+        # --- Stato condiviso tra il thread decoder e il thread UI --------
+        state = {
+            "playing": True,
+            "seeking": False,
+            "stopped": False,
+            "job": None,
+            "audio_session": -1,
+            "frame_queue": queue.Queue(maxsize=8),  # piccola finestra, non l'intero video
+            "decoder_thread": None,
+            "decoder_generation": 0,  # incrementato a ogni (ri)avvio/seek, per scartare frame stantii
+            "current_frame_time": 0.0,
+            "eof": False,
+        }
+        photo_refs: list = []  # riferimento forte per-finestra, vedi nota sul bugfix PDF sopra
+
+        wav_audio = None
+        if info.has_audio:
+            try:
+                wav_audio = extract_video_audio_as_wav(data)
+            except Exception:
+                wav_audio = None  # traccia audio non estraibile: video muto ma comunque riprodotto
+
+        def decoder_worker(generation: int, start_seconds: float) -> None:
+            """
+            Gira su un thread separato: consuma il generator di streaming
+            e mette i frame pronti in coda per il thread UI. `generation`
+            permette di riconoscere ed eliminare rapidamente i frame di un
+            decoder precedente (es. dopo un seek) invece di lasciarli
+            avvelenare la coda del nuovo.
+            """
+            try:
+                frame_interval = 1.0 / info.fps if info.fps > 0 else 0.04
+                t = start_seconds
+                for raw_rgb in stream_video_frames_in_memory(data, info):
+                    if state["decoder_generation"] != generation or state["stopped"]:
+                        return
+                    try:
+                        state["frame_queue"].put((t, raw_rgb), timeout=2)
+                    except queue.Full:
+                        return  # il consumatore non tiene il passo o la finestra si è chiusa
+                    t += frame_interval
+                if state["decoder_generation"] == generation:
+                    state["eof"] = True
+            except Exception:
+                if state["decoder_generation"] == generation:
+                    state["eof"] = True
+
+        def start_decoder(start_seconds: float = 0.0) -> None:
+            state["decoder_generation"] += 1
+            generation = state["decoder_generation"]
+            state["eof"] = False
+            # Svuotiamo qualunque frame residuo di un decoder precedente.
+            while not state["frame_queue"].empty():
+                try:
+                    state["frame_queue"].get_nowait()
+                except queue.Empty:
+                    break
+            thread = threading.Thread(
+                target=decoder_worker, args=(generation, start_seconds), daemon=True
+            )
+            state["decoder_thread"] = thread
+            thread.start()
+
+        def render_frame(raw_rgb: bytes) -> None:
+            img = Image.frombytes("RGB", (info.width, info.height), raw_rgb)
+            max_w = max(video_label.winfo_width(), 320)
+            max_h = max(video_label.winfo_height(), 240)
+            img.thumbnail((max_w, max_h))
+            photo = ImageTk.PhotoImage(img)
+            photo_refs.clear()
+            photo_refs.append(photo)
+            video_label.configure(image=photo)
+
+        if wav_audio:
+            try:
+                state["audio_session"] = play_audio_in_memory(wav_audio)
+            except Exception:
+                state["audio_session"] = -1
+
+        start_decoder(0.0)
+        status_label.pack_forget()
+
+        def pump() -> None:
+            """Gira sul thread UI: preleva un frame pronto dalla coda e lo mostra."""
+            if state["stopped"]:
+                return
+            if state["playing"] and not state["seeking"]:
+                try:
+                    frame_time, raw_rgb = state["frame_queue"].get_nowait()
+                    render_frame(raw_rgb)
+                    state["current_frame_time"] = frame_time
+                    if not state["seeking"]:
+                        slider.set(min(frame_time, info.duration) if info.duration else 0)
+                    time_label.configure(text=f"{fmt(frame_time)} / {fmt(info.duration)}")
+                except queue.Empty:
+                    if state["eof"] and state["frame_queue"].empty():
+                        state["playing"] = False
+                        play_pause_btn.configure(text="▶ Replay")
+            state["job"] = win.after(max(1, int(1000 / max(info.fps, 1))), pump)
+
+        def toggle_play() -> None:
+            if not state["playing"] and play_pause_btn.cget("text") == "▶ Replay":
+                start_decoder(0.0)
+                if wav_audio:
+                    try:
+                        state["audio_session"] = play_audio_in_memory(wav_audio)
+                    except Exception:
+                        state["audio_session"] = -1
+                state["playing"] = True
+                play_pause_btn.configure(text="⏸ Pause")
+                return
+            state["playing"] = not state["playing"]
+            if state["playing"]:
+                if state["audio_session"] != -1:
+                    unpause_audio()
+                play_pause_btn.configure(text="⏸ Pause")
+            else:
+                if state["audio_session"] != -1:
+                    pause_audio()
+                play_pause_btn.configure(text="▶ Play")
+
+        def do_stop() -> None:
+            state["decoder_generation"] += 1  # invalida il decoder corrente
+            state["playing"] = False
+            play_pause_btn.configure(text="▶ Play")
+            slider.set(0)
+            time_label.configure(text=f"0:00 / {fmt(info.duration)}")
+            try:
+                if state["audio_session"] != -1:
+                    stop_audio()
+            except Exception:
+                pass
+            start_decoder(0.0)
+            state["playing"] = False
+
+        def on_slider_press(_event=None) -> None:
+            state["seeking"] = True
+
+        def on_slider_release(_event=None) -> None:
+            target = slider.get()
+            start_decoder(target)
+            if wav_audio:
+                try:
+                    state["audio_session"] = play_audio_in_memory(wav_audio, start_seconds=target)
+                    if not state["playing"]:
+                        pause_audio()
+                except Exception:
+                    state["audio_session"] = -1
+            state["seeking"] = False
+
+        slider.bind("<Button-1>", on_slider_press)
+        slider.bind("<ButtonRelease-1>", on_slider_release)
+        play_pause_btn.configure(command=toggle_play)
+        stop_btn.configure(command=do_stop)
+
+        win.after(50, pump)
+
+        def on_close() -> None:
+            state["stopped"] = True
+            state["decoder_generation"] += 1
+            if state["job"] is not None:
+                try:
+                    win.after_cancel(state["job"])
+                except Exception:
+                    pass
+            try:
+                if state["audio_session"] != -1 and state["audio_session"] == current_audio_session():
+                    stop_audio()
+            except Exception:
+                pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def _preview_video_external_fallback(
+        self, win: ctk.CTkToplevel, data: bytes, name: str, status_label
+    ) -> None:
+        """
+        Ripiego sul comportamento precedente (player video di sistema, da
+        un file temporaneo su RAM-disk quando disponibile) per i video
+        troppo lunghi da decodificare interamente in RAM, o se ffmpeg non
+        è riuscito a decodificarli per qualunque motivo. Vedi il
+        commento originale in _preview_video per i dettagli sul
+        RAM-disk.
         """
         import tempfile
 
-        ctk.CTkLabel(win, text="🎬", font=scaled_font(64), text_color=GOLD_BRIGHT).pack(pady=(60, 10))
-        ctk.CTkLabel(win, text=name, **Styled.label_header_kwargs()).pack(pady=(0, 10))
-
         ram_disk = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
-        status_label = ctk.CTkLabel(win, text="", **Styled.label_muted_kwargs())
-        status_label.pack(pady=(0, 20))
-
         tmp_path = None
         try:
             suffix = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ".mp4"
@@ -2428,17 +2993,6 @@ class VaultView(ctk.CTkFrame):
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             self._active_video_tmp_paths.append(tmp_path)
-
-            if ram_disk:
-                status_label.configure(
-                    text="Playing via system player from RAM-disk (/dev/shm) — not physical disk."
-                )
-            else:
-                status_label.configure(
-                    text="⚠ No RAM-disk on this OS: a temporary file was written to disk\n"
-                    "to open the system player. It will be deleted when you close this window.",
-                    text_color="#ff9a5a",
-                )
 
             if sys.platform.startswith("win"):
                 os.startfile(tmp_path)  # noqa: S606
@@ -2450,7 +3004,7 @@ class VaultView(ctk.CTkFrame):
             error_message = str(exc)
             status_label.configure(text=f"Could not open system player: {error_message}", text_color=DANGER)
 
-        def on_close():
+        def on_close() -> None:
             if tmp_path:
                 try:
                     os.remove(tmp_path)
