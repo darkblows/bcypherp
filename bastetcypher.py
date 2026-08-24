@@ -49,6 +49,7 @@ import ctypes
 import ctypes.util
 import platform
 import sys
+import time
 import subprocess
 import hashlib
 import os
@@ -57,6 +58,7 @@ import zlib
 import io
 import threading
 import queue
+import contextlib
 import re
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -1206,29 +1208,102 @@ def _ffmpeg_platform_tag() -> str:
     return "linux-x86_64"
 
 
+@contextlib.contextmanager
+def _video_input_source(data: bytes):
+    """
+    Rende disponibile il video come un percorso di file che ffmpeg può
+    leggere con seek libero, invece che come stream sequenziale via
+    stdin pipe.
+
+    BUGFIX IMPORTANTE (causa reale di "alcuni video non vengono
+    riprodotti"): molti file MP4 hanno il proprio indice interno ("moov
+    atom") scritto alla FINE del file, non all'inizio — è il default di
+    export di molte fotocamere, telefoni, e persino alcune versioni di
+    ffmpeg stesso senza il flag +faststart. Quando ffmpeg legge il video
+    da uno stream sequenziale (come uno stdin pipe, l'approccio usato
+    inizialmente in questo modulo), non può "saltare avanti" a leggere
+    l'indice in fondo al file e poi tornare indietro: fallisce con errori
+    tipo "Cannot determine format of input" o "Could not open encoder
+    before EOF", anche se lo stesso identico file si apre perfettamente
+    con qualunque player normale (che legge da un file reale, dove il
+    seek è libero). Se apre invece il video da un percorso di file vero,
+    ffmpeg può leggere l'indice ovunque si trovi — motivo per cui questo
+    helper scrive il video su un file temporaneo prima di passarlo a
+    ffmpeg, invece di continuare a usare stdin pipe per l'INPUT (lo
+    stdout pipe per leggere i frame decodificati in streaming resta
+    invece perfettamente valido e viene mantenuto).
+
+    Il file temporaneo viene scritto su RAM-disk (/dev/shm su Linux, che
+    è memoria RAM esposta come filesystem, non storage persistente)
+    quando disponibile. Su Windows/macOS non esiste un tmpfs universale
+    accessibile senza privilegi aggiuntivi: in quel caso il file finisce
+    temporaneamente su disco reale — un compromesso necessario per la
+    compatibilità con la stragrande maggioranza dei file MP4/MOV/MKV
+    reali, dichiarato esplicitamente qui piuttosto che nascosto. Il file
+    viene cancellato non appena il blocco `with` termina, in ogni caso
+    (successo, eccezione, o interruzione).
+    """
+    import tempfile
+
+    ram_disk = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+    fd, tmp_path = tempfile.mkstemp(suffix=".vidsrc", dir=ram_disk)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        yield tmp_path
+    finally:
+        # BUGFIX per Windows: se il chiamante ha appena terminato
+        # forzatamente il processo ffmpeg (kill_active_processes in
+        # _preview_video, es. l'utente ha chiuso la finestra o fatto
+        # Stop/seek), il sistema operativo può impiegare un istante a
+        # rilasciare l'handle di Windows sul file prima che sia
+        # effettivamente cancellabile — a differenza di Linux, dove
+        # cancellare un file ancora aperto da un processo è quasi sempre
+        # permesso. Un breve retry evita di lasciare file orfani su
+        # disco Windows in questo caso specifico, senza rallentare
+        # percepibilmente il caso normale (dove il file si cancella al
+        # primo tentativo).
+        removed = False
+        for attempt in range(5):
+            try:
+                os.remove(tmp_path)
+                removed = True
+                break
+            except OSError:
+                if attempt < 4:
+                    time.sleep(0.1)
+        if not removed:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def probe_video_in_memory(data: bytes) -> VideoInfo:
     """
     Legge risoluzione, framerate, durata e presenza di una traccia audio
-    interrogando ffmpeg con il video passato via stdin — mai scritto su
-    disco. Solleva RuntimeError con un messaggio leggibile SOLO se non
-    riesce a determinare nemmeno la risoluzione (il minimo indispensabile
-    per poter decodificare qualcosa); fps e durata mancanti o malformati
-    ricadono su valori di default ragionevoli invece di bloccare
-    l'apertura del video, perché l'output testuale di debug di ffmpeg non
-    è un formato stabile o garantito — varia tra versioni, codec e
-    container, ed è più robusto tollerare un parsing parziale che
-    rifiutarsi di aprire un video altrimenti valido.
+    interrogando ffmpeg. Il video viene reso disponibile a ffmpeg tramite
+    _video_input_source (file temporaneo su RAM-disk quando possibile,
+    vedi quel commento per il perché: molti MP4 reali non sono leggibili
+    in streaming sequenziale puro). Solleva RuntimeError con un messaggio
+    leggibile SOLO se non riesce a determinare nemmeno la risoluzione (il
+    minimo indispensabile per poter decodificare qualcosa); fps e durata
+    mancanti o malformati ricadono su valori di default ragionevoli
+    invece di bloccare l'apertura del video, perché l'output testuale di
+    debug di ffmpeg non è un formato stabile o garantito — varia tra
+    versioni, codec e container, ed è più robusto tollerare un parsing
+    parziale che rifiutarsi di aprire un video altrimenti valido.
     """
     import re
 
     ffmpeg = _get_ffmpeg_exe()
-    proc = subprocess.Popen(
-        [ffmpeg, "-hide_banner", "-i", "pipe:0"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    _, stderr = proc.communicate(input=data)
+    with _video_input_source(data) as video_path:
+        proc = subprocess.Popen(
+            [ffmpeg, "-hide_banner", "-i", video_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _, stderr = proc.communicate()
     text = stderr.decode("utf-8", errors="ignore")
 
     # Isoliamo solo la riga "Video: ..." per limitare il raggio d'azione
@@ -1288,7 +1363,7 @@ def probe_video_in_memory(data: bytes) -> VideoInfo:
     return VideoInfo(width=width, height=height, fps=fps, duration=duration, has_audio=has_audio)
 
 
-def stream_video_frames_in_memory(data: bytes, info: VideoInfo):
+def stream_video_frames_in_memory(data: bytes, info: VideoInfo, start_seconds: float = 0.0, process_holder: Optional[list] = None):
     """
     Decodifica i frame del video come RGB24 grezzo UNO ALLA VOLTA, tramite
     un generator, invece di caricarli tutti insieme in una lista.
@@ -1312,65 +1387,79 @@ def stream_video_frames_in_memory(data: bytes, info: VideoInfo):
     durata del video — cresce solo con la RISOLUZIONE del singolo frame,
     mai con la sua lunghezza — e il primo frame è disponibile quasi
     subito invece di dover attendere la decodifica completa del video.
+
+    L'INPUT del video passa da _video_input_source (file temporaneo su
+    RAM-disk quando possibile) invece che da stdin pipe: molti file MP4
+    reali hanno l'indice interno alla fine del file e non sono leggibili
+    da ffmpeg in streaming sequenziale puro — vedi il commento completo
+    su _video_input_source per i dettagli. Questo era la causa reale di
+    "alcuni video non vengono riprodotti": non erano corrotti, semplicemente
+    incompatibili con la lettura via pipe che veniva usata prima.
+
+    `process_holder`, se fornito (una lista mutabile a un elemento), viene
+    popolato con il processo ffmpeg non appena avviato — permette al
+    chiamante di terminarlo esplicitamente dall'esterno (process_holder[0]
+    .kill()) se l'utente chiude la finestra di anteprima mentre il
+    generator è bloccato in attesa di leggere il prossimo frame:
+    BUGFIX — senza questo, chiudere la finestra a metà riproduzione
+    lasciava il processo ffmpeg vivo in background (leak di processo),
+    perché il generator controlla il proprio stato "interrotto" solo TRA
+    un frame e l'altro, non mentre è bloccato in lettura.
     """
     ffmpeg = _get_ffmpeg_exe()
-    cmd = [
-        ffmpeg, "-i", "pipe:0",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-vf", f"fps={info.fps}",
-        "pipe:1",
-    ]
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
     frame_size = info.width * info.height * 3
     if frame_size <= 0:
-        proc.kill()
         raise RuntimeError("Invalid video dimensions.")
 
-    # Scriviamo l'input su un thread separato: se scrivessimo tutto lo
-    # stdin in blocco PRIMA di iniziare a leggere lo stdout, e ffmpeg
-    # riempisse il suo buffer di output prima di aver consumato tutto
-    # l'input, i due processi si bloccherebbero a vicenda (deadlock
-    # classico dei pipe bidirezionali — un rischio concreto su Windows,
-    # dove le dimensioni dei buffer dei pipe sono spesso più piccole che
-    # su Linux/macOS, rendendo questo scenario più probabile di quanto
-    # sembri con video anche non enormi).
-    def feed_stdin():
+    with _video_input_source(data) as video_path:
+        cmd = [ffmpeg, "-hide_banner"]
+        if start_seconds > 0:
+            # -ss PRIMA di -i usa il seek veloce basato su keyframe di
+            # ffmpeg: salta quasi istantaneamente al punto richiesto
+            # invece di dover decodificare e scartare tutti i frame
+            # precedenti, importante per non bloccare l'interfaccia
+            # quando l'utente trascina la barra di avanzamento.
+            cmd += ["-ss", f"{start_seconds:.3f}"]
+        cmd += [
+            "-i", video_path,
+            "-map", "0:v:0",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-vf", f"fps={info.fps}",
+            "pipe:1",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if process_holder is not None:
+            process_holder.append(proc)
         try:
-            proc.stdin.write(data)
-        except (BrokenPipeError, OSError):
-            pass  # ffmpeg può aver già chiuso stdin se il video è invalido
+            while True:
+                chunk = proc.stdout.read(frame_size)
+                if len(chunk) < frame_size:
+                    break
+                yield chunk
         finally:
             try:
-                proc.stdin.close()
+                proc.stdout.close()
             except OSError:
                 pass
-
-    writer_thread = threading.Thread(target=feed_stdin, daemon=True)
-    writer_thread.start()
-
-    try:
-        while True:
-            chunk = proc.stdout.read(frame_size)
-            if len(chunk) < frame_size:
-                break
-            yield chunk
-    finally:
-        try:
-            proc.stdout.close()
-        except OSError:
-            pass
-        proc.wait(timeout=5)
-        writer_thread.join(timeout=5)
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=5)
 
 
 def extract_video_audio_as_wav(data: bytes) -> Optional[bytes]:
     """
     Estrae la traccia audio del video come WAV valido, interamente in RAM.
 
-    Nota tecnica: chiedere direttamente a ffmpeg un WAV su uno stdout pipe
-    produce un header con la dimensione dei dati non dichiarata
+    Nota tecnica 1: come per probe_video_in_memory e
+    stream_video_frames_in_memory, l'input passa da un file temporaneo
+    (via _video_input_source) invece che da stdin pipe — molti MP4/MOV/MKV
+    reali non sono leggibili in streaming sequenziale puro (indice del
+    file in fondo, non in testa). Vedi il commento su _video_input_source.
+
+    Nota tecnica 2: chiedere direttamente a ffmpeg un WAV su uno stdout
+    pipe produce un header con la dimensione dei dati non dichiarata
     correttamente (ffmpeg non conosce in anticipo quanti byte scriverà su
     uno stream, quindi lascia un valore segnaposto) — file che alcuni
     lettori (incluso mutagen, già usato altrove in questo programma per
@@ -1383,15 +1472,14 @@ def extract_video_audio_as_wav(data: bytes) -> Optional[bytes]:
     import wave
 
     ffmpeg = _get_ffmpeg_exe()
-    cmd = [
-        ffmpeg, "-i", "pipe:0", "-vn",
-        "-f", "s16le", "-ar", "44100", "-ac", "2",
-        "pipe:1",
-    ]
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    stdout, _ = proc.communicate(input=data)
+    with _video_input_source(data) as video_path:
+        cmd = [
+            ffmpeg, "-hide_banner", "-i", video_path, "-vn",
+            "-f", "s16le", "-ar", "44100", "-ac", "2",
+            "pipe:1",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, _ = proc.communicate()
     if not stdout:
         return None  # nessuna traccia audio, o estrazione fallita
     buf = _io.BytesIO()
@@ -2810,6 +2898,7 @@ class VaultView(ctk.CTkFrame):
             "decoder_generation": 0,  # incrementato a ogni (ri)avvio/seek, per scartare frame stantii
             "current_frame_time": 0.0,
             "eof": False,
+            "active_processes": [],  # BUGFIX: tiene traccia dei processi ffmpeg vivi, vedi on_close/do_stop
         }
         photo_refs: list = []  # riferimento forte per-finestra, vedi nota sul bugfix PDF sopra
 
@@ -2831,7 +2920,11 @@ class VaultView(ctk.CTkFrame):
             try:
                 frame_interval = 1.0 / info.fps if info.fps > 0 else 0.04
                 t = start_seconds
-                for raw_rgb in stream_video_frames_in_memory(data, info):
+                proc_holder: list = []
+                state["active_processes"].append(proc_holder)
+                for raw_rgb in stream_video_frames_in_memory(
+                    data, info, start_seconds=start_seconds, process_holder=proc_holder
+                ):
                     if state["decoder_generation"] != generation or state["stopped"]:
                         return
                     try:
@@ -2845,10 +2938,50 @@ class VaultView(ctk.CTkFrame):
                 if state["decoder_generation"] == generation:
                     state["eof"] = True
 
+        def kill_active_processes() -> None:
+            """
+            BUGFIX: termina esplicitamente qualunque processo ffmpeg
+            ancora vivo per questa finestra. Necessario perché il
+            generator di streaming controlla il proprio stato
+            "interrotto" solo tra un frame e l'altro — se è bloccato in
+            attesa di leggere il prossimo frame da ffmpeg (es. ffmpeg è
+            lento, o il consumer si è fermato), quel controllo non scatta
+            mai finché non arriva un nuovo frame, lasciando il processo
+            ffmpeg vivo indefinitamente in background dopo la chiusura
+            della finestra o uno Stop. Chiamata da start_decoder() prima
+            di avviarne uno nuovo (es. dopo un seek) e da on_close()/
+            do_stop() alla chiusura o all'arresto esplicito.
+
+            Dopo kill() chiamiamo anche wait() (con timeout breve, su un
+            thread separato per non bloccare la UI): senza di essa il
+            processo terminato resta come zombie nella tabella processi
+            del sistema operativo finché nessuno "raccoglie" il suo stato
+            di uscita — non consuma più CPU/RAM attivamente, ma è comunque
+            una risorsa di sistema non ripulita correttamente.
+            """
+            procs_to_wait = []
+            for proc_holder in state["active_processes"]:
+                if proc_holder:
+                    try:
+                        proc_holder[0].kill()
+                        procs_to_wait.append(proc_holder[0])
+                    except Exception:
+                        pass
+            state["active_processes"].clear()
+            if procs_to_wait:
+                def reap():
+                    for p in procs_to_wait:
+                        try:
+                            p.wait(timeout=3)
+                        except Exception:
+                            pass
+                threading.Thread(target=reap, daemon=True).start()
+
         def start_decoder(start_seconds: float = 0.0) -> None:
             state["decoder_generation"] += 1
             generation = state["decoder_generation"]
             state["eof"] = False
+            kill_active_processes()  # il decoder precedente non serve più
             # Svuotiamo qualunque frame residuo di un decoder precedente.
             while not state["frame_queue"].empty():
                 try:
@@ -2958,6 +3091,7 @@ class VaultView(ctk.CTkFrame):
         def on_close() -> None:
             state["stopped"] = True
             state["decoder_generation"] += 1
+            kill_active_processes()
             if state["job"] is not None:
                 try:
                     win.after_cancel(state["job"])
