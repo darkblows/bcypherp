@@ -131,16 +131,7 @@ def disable_core_dumps() -> None:
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         except Exception:
             pass
-
-
 def _harden_windows_process() -> None:
-    """Enable Windows mitigations that are compatible with a Python desktop app.
-
-    These policies reduce common DLL/AppInit and remote-image injection paths.  They
-    deliberately do not enable the dynamic-code prohibition: Python extensions and
-    bundled libraries are allowed to use legitimate executable memory on some
-    systems, and blocking it would make the application unreliable.
-    """
     if _SYSTEM != "Windows":
         return
     try:
@@ -148,31 +139,22 @@ def _harden_windows_process() -> None:
         set_default_dll_directories = kernel32.SetDefaultDllDirectories
         set_default_dll_directories.argtypes = [ctypes.c_uint32]
         set_default_dll_directories.restype = ctypes.c_bool
-        # LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: application dir, System32 and user DLL dirs.
         set_default_dll_directories(0x00001000)
-
         set_mitigation_policy = kernel32.SetProcessMitigationPolicy
         set_mitigation_policy.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
         set_mitigation_policy.restype = ctypes.c_bool
-
         def set_policy(policy: int, flags: int) -> None:
             data = ctypes.c_uint32(flags)
             set_mitigation_policy(
                 policy, ctypes.byref(data), ctypes.sizeof(data)
             )
-
-        # DEP, bottom-up/high-entropy ASLR, no AppInit DLLs and no remote/low-integrity DLLs.
-        set_policy(0, 0x00000001)   # ProcessDEPPolicy
-        set_policy(1, 0x00000005)   # ProcessASLRPolicy
-        set_policy(6, 0x00000001)   # ProcessExtensionPointDisablePolicy
-        set_policy(10, 0x00000003)  # ProcessImageLoadPolicy
+        set_policy(0, 0x00000001)
+        set_policy(1, 0x00000005)
+        set_policy(6, 0x00000001)
+        set_policy(10, 0x00000003)
     except Exception:
-        # Mitigations differ by Windows release; a missing policy must not stop startup.
         pass
-
-
 def _harden_linux_process() -> None:
-    """Make same-user debugging/privilege escalation harder on Linux."""
     if _SYSTEM != "Linux":
         return
     try:
@@ -181,12 +163,10 @@ def _harden_linux_process() -> None:
         prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
                            ctypes.c_ulong, ctypes.c_ulong]
         prctl.restype = ctypes.c_int
-        prctl(4, 0, 0, 0, 0)   # PR_SET_DUMPABLE: deny ordinary ptrace/core access.
-        prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS: child processes cannot gain privileges.
+        prctl(4, 0, 0, 0, 0)
+        prctl(38, 1, 0, 0, 0)
     except Exception:
         pass
-
-
 def harden_process() -> None:
     disable_core_dumps()
     _harden_windows_process()
@@ -545,7 +525,6 @@ def build_bca(
             )
             try:
                 name_bytes = entry.name.encode("utf-8")
-
                 compressed = deflate_raw_compress(entry.data)
                 crc = crc32(entry.data)
                 parts.append(struct.pack("<H", len(name_bytes)))
@@ -615,8 +594,6 @@ def parse_bca(
         raise BCAFormatError("Versione archivio non supportata.")
     salt = bytes(d[5:37])
     iterations = struct.unpack("<I", d[37:41])[0]
-    # In v1 this value is fixed.  Rejecting a modified header prevents a hostile
-    # file from forcing an impractically expensive PBKDF2 before authentication.
     if iterations != BCA_ITERS:
         raise BCAFormatError("Parametro PBKDF2 non valido per questo archivio.")
     iv1 = bytes(d[41:53])
@@ -1123,12 +1100,8 @@ class Styled:
     @staticmethod
     def label_muted_kwargs() -> dict:
         return dict(text_color=STONE_PALE, font=FONT_BODY_ITALIC)
-
-
 class ButtonSpinner:
-    """Keeps a blocking-action button visibly alive until its worker finishes."""
     _FRAMES = ("◐", "◓", "◑", "◒")
-
     def __init__(self, button: ctk.CTkButton) -> None:
         self.button = button
         self._active = False
@@ -1137,7 +1110,6 @@ class ButtonSpinner:
         self._original_text = ""
         self._original_state = "normal"
         self._label = ""
-
     def start(self, label: str) -> None:
         if self._active:
             return
@@ -1147,11 +1119,9 @@ class ButtonSpinner:
         self._original_text = self.button.cget("text")
         self._original_state = self.button.cget("state")
         self._tick()
-
     @property
     def active(self) -> bool:
         return self._active
-
     def _tick(self) -> None:
         if not self._active:
             return
@@ -1163,7 +1133,6 @@ class ButtonSpinner:
         except tk.TclError:
             self._active = False
             self._job = None
-
     def stop(self) -> None:
         if not self._active:
             return
@@ -1178,8 +1147,6 @@ class ButtonSpinner:
             self.button.configure(text=self._original_text, state=self._original_state)
         except tk.TclError:
             pass
-
-
 PIM_RE = re.compile(r"^\d{1,32}$")
 class GeneratorView(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
@@ -1766,9 +1733,7 @@ class VaultView(ctk.CTkFrame):
         if hasattr(app, "_app_icon_photo"):
             win.after(250, lambda: win.iconphoto(False, app._app_icon_photo))
         win.after(100, lambda: apply_screen_capture_protection(win))
-
         if kind == ViewerKind.PDF:
-            # Let the empty preview window paint before rendering a large PDF.
             pdf_data = bytes(entry.data)
             win.after(1, lambda: self._preview_pdf(win, pdf_data, source_spinner))
             return
@@ -1842,7 +1807,6 @@ class VaultView(ctk.CTkFrame):
             zoom_label.configure(
                 text=f"Zoom: {round(scale * 100)}%  •  Use mouse wheel to zoom{suffix}"
             )
-
         def animate_gif() -> None:
             if not animated:
                 return
@@ -1854,7 +1818,6 @@ class VaultView(ctk.CTkFrame):
                 state["animation_job"] = win.after(delay_ms, animate_gif)
             except (tk.TclError, EOFError):
                 state["animation_job"] = None
-
         def on_mousewheel(event) -> None:
             direction = 1 if event.delta > 0 else -1
             zoom_step(direction)
@@ -1876,7 +1839,6 @@ class VaultView(ctk.CTkFrame):
         win.after(50, render_at_scale)
         if animated:
             win.after(60, animate_gif)
-
         def on_close() -> None:
             if state["job"] is not None:
                 try:
@@ -1893,26 +1855,22 @@ class VaultView(ctk.CTkFrame):
             except Exception:
                 pass
             win.destroy()
-
         win.protocol("WM_DELETE_WINDOW", on_close)
     def _preview_pdf(
         self, win: ctk.CTkToplevel, data: bytes,
         source_spinner: Optional[ButtonSpinner] = None,
     ) -> None:
-        """Render PDFs off the UI thread and add pages incrementally."""
         loading = ctk.CTkLabel(
             win, text="◐  Rendering PDF securely in memory...",
             **Styled.label_muted_kwargs(),
         )
         loading.pack(expand=True)
         loading_state = {"index": 0, "job": None}
-
         def window_exists() -> bool:
             try:
                 return bool(win.winfo_exists())
             except tk.TclError:
                 return False
-
         def tick() -> None:
             if not window_exists():
                 return
@@ -1920,7 +1878,6 @@ class VaultView(ctk.CTkFrame):
             loading.configure(text=f"{frame}  Rendering PDF securely in memory...")
             loading_state["index"] = (loading_state["index"] + 1) % len(ButtonSpinner._FRAMES)
             loading_state["job"] = win.after(140, tick)
-
         def finish_loading() -> None:
             if loading_state["job"] is not None:
                 try:
@@ -1929,11 +1886,9 @@ class VaultView(ctk.CTkFrame):
                     pass
             if window_exists():
                 loading.destroy()
-
         def stop_source_spinner() -> None:
             if source_spinner is not None:
                 source_spinner.stop()
-
         def show_error(message: str) -> None:
             if not window_exists():
                 stop_source_spinner()
@@ -1943,7 +1898,6 @@ class VaultView(ctk.CTkFrame):
                 win, text=f"Could not display PDF:\n{message}", text_color=DANGER,
             ).pack(expand=True, padx=20)
             stop_source_spinner()
-
         def show_pages(pages: List[RenderedPage]) -> None:
             if not window_exists():
                 stop_source_spinner()
@@ -1970,7 +1924,6 @@ class VaultView(ctk.CTkFrame):
             page_image_labels: dict[int, tk.Label] = {}
             zoom_state = {"value": 1.0}
             search_state = {"matches": [], "index": 0}
-
             def refresh_page_image(index: int) -> None:
                 page = pages[index]
                 image_label = page_image_labels.get(index)
@@ -1982,7 +1935,6 @@ class VaultView(ctk.CTkFrame):
                 photo_refs[index] = photo
                 image_label.configure(image=photo)
                 image_label.image = photo
-
             def show_page(page_index: int) -> None:
                 page_frame = page_frames.get(page_index)
                 if page_frame is None:
@@ -2006,7 +1958,6 @@ class VaultView(ctk.CTkFrame):
                     )
                 else:
                     match_label.configure(text=f"Page {page_index + 1} / {max(1, len(pages))}")
-
             def find_text(direction: int = 0) -> None:
                 query = search_var.get().strip().casefold()
                 if not query:
@@ -2024,13 +1975,11 @@ class VaultView(ctk.CTkFrame):
                     match_label.configure(text="No matches")
                     return
                 show_page(matches[search_state["index"]])
-
             def change_zoom(factor: float) -> None:
                 zoom_state["value"] = max(0.5, min(2.0, zoom_state["value"] * factor))
                 for page_index in page_image_labels:
                     refresh_page_image(page_index)
                 match_label.configure(text=f"Zoom {round(zoom_state['value'] * 100)}%")
-
             ctk.CTkButton(
                 toolbar, text="Find", width=58, command=find_text,
                 **Styled.secondary_button_kwargs(),
@@ -2052,7 +2001,6 @@ class VaultView(ctk.CTkFrame):
                 **Styled.secondary_button_kwargs(),
             ).pack(side="right", padx=3, pady=8)
             search_entry.bind("<Return>", lambda _event: find_text(1))
-
             def add_page(index: int = 0) -> None:
                 if not window_exists():
                     stop_source_spinner()
@@ -2077,9 +2025,7 @@ class VaultView(ctk.CTkFrame):
                     show_error(str(exc))
                     return
                 win.after(1, lambda: add_page(index + 1))
-
             add_page()
-
         def worker() -> None:
             try:
                 pages = render_pdf_pages_in_memory(data, dpi=100, max_pages=30)
@@ -2087,7 +2033,6 @@ class VaultView(ctk.CTkFrame):
                 self.after(0, lambda: show_error(str(exc)))
                 return
             self.after(0, lambda: show_pages(pages))
-
         tick()
         threading.Thread(target=worker, daemon=True).start()
     def _preview_text(self, win: ctk.CTkToplevel, data: bytes) -> None:
@@ -2137,7 +2082,6 @@ class VaultView(ctk.CTkFrame):
         def on_volume_change(value: float) -> None:
             state["volume"] = float(value)
             set_audio_volume(state["volume"])
-
         volume_slider.configure(command=on_volume_change)
         def on_slider_press(_event=None):
             state["seeking"] = True
@@ -2320,12 +2264,10 @@ class VaultView(ctk.CTkFrame):
                 wav_audio = extract_video_audio_as_wav(data)
             except Exception:
                 wav_audio = None
-
         def on_volume_change(value: float) -> None:
             state["volume"] = float(value)
             if state["audio_session"] != -1:
                 set_audio_volume(state["volume"])
-
         volume_slider.configure(command=on_volume_change)
         if wav_audio is None:
             volume_slider.configure(state="disabled")
@@ -2529,7 +2471,6 @@ class VaultView(ctk.CTkFrame):
         data = bytes(entry.data)
         if source_spinner is not None:
             source_spinner.start("Exporting...")
-
         def worker() -> None:
             try:
                 with open(path, "wb") as f:
@@ -2538,17 +2479,14 @@ class VaultView(ctk.CTkFrame):
                 self.after(0, lambda: on_error(str(exc)))
                 return
             self.after(0, on_success)
-
         def on_success() -> None:
             if source_spinner is not None:
                 source_spinner.stop()
             messagebox.showinfo("Vault", f"File exported to:\n{path}")
-
         def on_error(message: str) -> None:
             if source_spinner is not None:
                 source_spinner.stop()
             messagebox.showerror("Error", f"Export failed: {message}")
-
         threading.Thread(target=worker, daemon=True).start()
     def _close_vault(self) -> None:
         for entry in self._open_entries:
