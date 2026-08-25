@@ -872,23 +872,43 @@ def probe_video_in_memory(data: bytes) -> VideoInfo:
             duration = 0.0
     has_audio = bool(re.search(r"Stream.*Audio:", text))
     return VideoInfo(width=width, height=height, fps=fps, duration=duration, has_audio=has_audio)
-def stream_video_frames_in_memory(data: bytes, info: VideoInfo, start_seconds: float = 0.0, process_holder: Optional[list] = None):
+def _fit_decode_size(src_w: int, src_h: int, target_w: int, target_h: int) -> tuple[int, int]:
+    if target_w <= 0 or target_h <= 0 or src_w <= 0 or src_h <= 0:
+        return src_w, src_h
+    if src_w <= target_w and src_h <= target_h:
+        return src_w, src_h
+    scale = min(target_w / src_w, target_h / src_h)
+    out_w = max(2, int(src_w * scale) // 2 * 2)
+    out_h = max(2, int(src_h * scale) // 2 * 2)
+    return out_w, out_h
+def stream_video_frames_in_memory(
+    data: bytes, info: VideoInfo, start_seconds: float = 0.0,
+    process_holder: Optional[list] = None,
+    decode_size: Optional[tuple[int, int]] = None,
+):
     ffmpeg = _get_ffmpeg_exe()
-    frame_size = info.width * info.height * 3
+    out_w, out_h = decode_size if decode_size else (info.width, info.height)
+    frame_size = out_w * out_h * 3
     if frame_size <= 0:
         raise RuntimeError("Invalid video dimensions.")
     with _video_input_source(data) as video_path:
         cmd = [ffmpeg, "-hide_banner"]
         if start_seconds > 0:
             cmd += ["-ss", f"{start_seconds:.3f}"]
+        vf = f"fps={info.fps}"
+        if (out_w, out_h) != (info.width, info.height):
+            vf += f",scale={out_w}:{out_h}:flags=fast_bilinear"
         cmd += [
             "-i", video_path,
             "-map", "0:v:0",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-vf", f"fps={info.fps}",
+            "-vf", vf,
             "pipe:1",
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=frame_size * 2,
+        )
         if process_holder is not None:
             process_holder.append(proc)
         try:
@@ -1775,12 +1795,27 @@ class VaultView(ctk.CTkFrame):
         max_w, max_h = 760, 640
         orig_w, orig_h = original_img.size
         fit_scale = min(max_w / orig_w, max_h / orig_h, 1.0)
+        # A reduced-resolution proxy used only for interactive (in-motion) zoom renders.
+        # Resizing a huge source image on every wheel tick is what makes zooming feel
+        # sluggish; the proxy caps the work per tick while the user is actively
+        # scrolling, and the true full-resolution image is used once scrolling settles.
+        PROXY_MAX_DIM = 1600
+        proxy_img = None
+        if not animated and max(orig_w, orig_h) > PROXY_MAX_DIM:
+            proxy_scale = PROXY_MAX_DIM / max(orig_w, orig_h)
+            proxy_img = original_img.resize(
+                (max(1, round(orig_w * proxy_scale)), max(1, round(orig_h * proxy_scale))),
+                Image.BILINEAR,
+            )
         state = {
             "scale": fit_scale,
             "photo": None,
             "job": None,
             "animation_job": None,
             "frame_index": 0,
+            "canvas_image_id": None,
+            "settle_job": None,
+            "pending_job": None,
         }
         MIN_SCALE = 0.05
         MAX_SCALE = 8.0
@@ -1791,17 +1826,31 @@ class VaultView(ctk.CTkFrame):
             original_img.seek(state["frame_index"])
             return original_img.convert("RGBA")
 
-        def render_at_scale() -> None:
+        def render_at_scale(fast: bool = False) -> None:
             scale = state["scale"]
             new_w = max(1, round(orig_w * scale))
             new_h = max(1, round(orig_h * scale))
-            resized = active_frame().resize((new_w, new_h), Image.LANCZOS)
+            if fast and proxy_img is not None:
+                source_img = proxy_img
+                resample = Image.BILINEAR
+            else:
+                source_img = active_frame()
+                resample = Image.BILINEAR if fast else Image.LANCZOS
+            if source_img.size == (new_w, new_h):
+                resized = source_img
+            else:
+                resized = source_img.resize((new_w, new_h), resample)
             photo = ImageTk.PhotoImage(resized)
             state["photo"] = photo
-            canvas.delete("all")
             canvas_w = max(canvas.winfo_width(), 1)
             canvas_h = max(canvas.winfo_height(), 1)
-            canvas.create_image(canvas_w // 2, canvas_h // 2, image=photo, anchor="center")
+            if state["canvas_image_id"] is None:
+                state["canvas_image_id"] = canvas.create_image(
+                    canvas_w // 2, canvas_h // 2, image=photo, anchor="center"
+                )
+            else:
+                canvas.coords(state["canvas_image_id"], canvas_w // 2, canvas_h // 2)
+                canvas.itemconfigure(state["canvas_image_id"], image=photo)
             canvas.configure(scrollregion=(0, 0, new_w, new_h))
             suffix = "  •  GIF animated" if animated else ""
             zoom_label.configure(
@@ -1825,17 +1874,42 @@ class VaultView(ctk.CTkFrame):
             zoom_step(1)
         def on_scroll_down(_event=None) -> None:
             zoom_step(-1)
+        def render_settled() -> None:
+            state["settle_job"] = None
+            render_at_scale(fast=False)
+        def render_throttled() -> None:
+            # Actually perform the pending resize now, then release the throttle.
+            state["pending_job"] = None
+            render_at_scale(fast=True)
+            if state["settle_job"] is not None:
+                win.after_cancel(state["settle_job"])
+            state["settle_job"] = win.after(140, render_settled)
         def zoom_step(direction: int) -> None:
             factor = 1.1 if direction > 0 else (1 / 1.1)
             new_scale = state["scale"] * factor
             state["scale"] = max(MIN_SCALE, min(MAX_SCALE, new_scale))
-            if state["job"] is not None:
-                win.after_cancel(state["job"])
-            state["job"] = win.after(30, render_at_scale)
+            # Mouse wheels can fire many events per second — resizing the full-res
+            # source on every single tick is what causes the stutter. Coalesce bursts
+            # of wheel events into a single resize a few ms later, so a fast scroll
+            # only pays for one resize instead of one per tick.
+            if state["settle_job"] is not None:
+                win.after_cancel(state["settle_job"])
+                state["settle_job"] = None
+            if state["pending_job"] is not None:
+                win.after_cancel(state["pending_job"])
+            state["pending_job"] = win.after(16, render_throttled)
+        def on_resize(_event=None) -> None:
+            if state["pending_job"] is not None:
+                win.after_cancel(state["pending_job"])
+                state["pending_job"] = None
+            render_at_scale(fast=True)
+            if state["settle_job"] is not None:
+                win.after_cancel(state["settle_job"])
+            state["settle_job"] = win.after(120, render_settled)
         canvas.bind("<MouseWheel>", on_mousewheel)
         canvas.bind("<Button-4>", on_scroll_up)
         canvas.bind("<Button-5>", on_scroll_down)
-        canvas.bind("<Configure>", lambda _e: render_at_scale())
+        canvas.bind("<Configure>", on_resize)
         win.after(50, render_at_scale)
         if animated:
             win.after(60, animate_gif)
@@ -1843,6 +1917,16 @@ class VaultView(ctk.CTkFrame):
             if state["job"] is not None:
                 try:
                     win.after_cancel(state["job"])
+                except tk.TclError:
+                    pass
+            if state["pending_job"] is not None:
+                try:
+                    win.after_cancel(state["pending_job"])
+                except tk.TclError:
+                    pass
+            if state["settle_job"] is not None:
+                try:
+                    win.after_cancel(state["settle_job"])
                 except tk.TclError:
                     pass
             if state["animation_job"] is not None:
@@ -1924,14 +2008,29 @@ class VaultView(ctk.CTkFrame):
             page_image_labels: dict[int, tk.Label] = {}
             zoom_state = {"value": 1.0}
             search_state = {"matches": [], "index": 0}
-            def refresh_page_image(index: int) -> None:
+            page_base_images: dict[int, Image.Image] = {}
+            def refresh_page_image(index: int, fast: bool = False) -> None:
                 page = pages[index]
                 image_label = page_image_labels.get(index)
                 if image_label is None:
                     return
-                pil_img = Image.open(io.BytesIO(page.png_bytes))
-                pil_img.thumbnail((round(760 * zoom_state["value"]), round(1000 * zoom_state["value"])))
-                photo = ImageTk.PhotoImage(pil_img)
+                base_img = page_base_images.get(index)
+                if base_img is None:
+                    base_img = Image.open(io.BytesIO(page.png_bytes))
+                    base_img.load()
+                    page_base_images[index] = base_img
+                base_w, base_h = base_img.size
+                box_w = round(760 * zoom_state["value"])
+                box_h = round(1000 * zoom_state["value"])
+                scale = min(box_w / base_w, box_h / base_h) if base_w and base_h else 1.0
+                new_w = max(1, round(base_w * scale))
+                new_h = max(1, round(base_h * scale))
+                resample = Image.BILINEAR if fast else Image.LANCZOS
+                if (new_w, new_h) == (base_w, base_h):
+                    resized = base_img
+                else:
+                    resized = base_img.resize((new_w, new_h), resample)
+                photo = ImageTk.PhotoImage(resized)
                 photo_refs[index] = photo
                 image_label.configure(image=photo)
                 image_label.image = photo
@@ -1975,11 +2074,86 @@ class VaultView(ctk.CTkFrame):
                     match_label.configure(text="No matches")
                     return
                 show_page(matches[search_state["index"]])
+            zoom_jobs = {"settle": None, "trickle": None}
+            page_zoom_rendered = {}  # index -> zoom value it was last rendered at
+            def _visible_page_indices() -> list:
+                canvas_ = getattr(scroll, "_parent_canvas", None)
+                if canvas_ is None:
+                    return list(page_frames.keys())[:1]
+                try:
+                    top_frac, bottom_frac = canvas_.yview()
+                    bbox = canvas_.bbox("all")
+                    if not bbox or bbox[3] <= 0:
+                        return list(page_frames.keys())[:1]
+                    top_y = top_frac * bbox[3]
+                    bottom_y = bottom_frac * bbox[3]
+                    visible = []
+                    for idx, frame in page_frames.items():
+                        frame_top = frame.winfo_y()
+                        frame_bottom = frame_top + max(frame.winfo_height(), 1)
+                        if frame_bottom >= top_y and frame_top <= bottom_y:
+                            visible.append(idx)
+                    return visible or list(page_frames.keys())[:1]
+                except tk.TclError:
+                    return list(page_frames.keys())[:1]
+            def _trickle_refresh(indices: list, fast: bool, zoom_value: float) -> None:
+                if not indices:
+                    zoom_jobs["trickle"] = None
+                    return
+                # Only spend time on a page if it's still relevant: the zoom hasn't
+                # moved on again since this batch was queued, and the page isn't
+                # already rendered at this exact zoom level.
+                if zoom_state["value"] != zoom_value:
+                    zoom_jobs["trickle"] = None
+                    return
+                idx = indices.pop(0)
+                if idx in page_image_labels and page_zoom_rendered.get(idx) != zoom_value:
+                    refresh_page_image(idx, fast=fast)
+                    page_zoom_rendered[idx] = zoom_value
+                # Give the event loop real breathing room between pages instead of a
+                # near-zero delay, so scrolling/other input stays responsive while the
+                # rest of the document catches up in the background.
+                zoom_jobs["trickle"] = win.after(
+                    30, lambda: _trickle_refresh(indices, fast, zoom_value)
+                )
             def change_zoom(factor: float) -> None:
                 zoom_state["value"] = max(0.5, min(2.0, zoom_state["value"] * factor))
-                for page_index in page_image_labels:
-                    refresh_page_image(page_index)
-                match_label.configure(text=f"Zoom {round(zoom_state['value'] * 100)}%")
+                zoom_value = zoom_state["value"]
+                match_label.configure(text=f"Zoom {round(zoom_value * 100)}%")
+                if zoom_jobs["trickle"] is not None:
+                    try:
+                        win.after_cancel(zoom_jobs["trickle"])
+                    except tk.TclError:
+                        pass
+                    zoom_jobs["trickle"] = None
+                if zoom_jobs["settle"] is not None:
+                    try:
+                        win.after_cancel(zoom_jobs["settle"])
+                    except tk.TclError:
+                        pass
+                    zoom_jobs["settle"] = None
+                # Only the pages actually on screen right now get redrawn immediately;
+                # everything else is refreshed lazily in the background. This is what
+                # keeps +/- clicks snappy even in large documents.
+                visible = _visible_page_indices()
+                for idx in visible:
+                    if idx in page_image_labels:
+                        refresh_page_image(idx, fast=True)
+                        page_zoom_rendered[idx] = zoom_value
+                remaining = [i for i in page_image_labels if i not in visible]
+                if remaining:
+                    zoom_jobs["trickle"] = win.after(
+                        30, lambda: _trickle_refresh(remaining, True, zoom_value)
+                    )
+                def settle() -> None:
+                    zoom_jobs["settle"] = None
+                    if zoom_state["value"] != zoom_value:
+                        return
+                    for idx in visible:
+                        if idx in page_image_labels:
+                            refresh_page_image(idx, fast=False)
+                            page_zoom_rendered[idx] = zoom_value
+                zoom_jobs["settle"] = win.after(150, settle)
             ctk.CTkButton(
                 toolbar, text="Find", width=58, command=find_text,
                 **Styled.secondary_button_kwargs(),
@@ -2255,7 +2429,14 @@ class VaultView(ctk.CTkFrame):
             "active_processes": [],
             "audio_stopped": False,
             "volume": 0.8,
+            "decode_size": (info.width, info.height),
         }
+        win.update_idletasks()
+        area_w = max(video_label.winfo_width(), 320)
+        area_h = max(video_label.winfo_height(), 240)
+        state["decode_size"] = _fit_decode_size(
+            info.width, info.height, area_w * 2, area_h * 2
+        )
         volume_slider.set(state["volume"])
         photo_refs: list = []
         wav_audio = None
@@ -2277,13 +2458,24 @@ class VaultView(ctk.CTkFrame):
                 t = start_seconds
                 proc_holder: list = []
                 state["active_processes"].append(proc_holder)
+                decode_w, decode_h = state["decode_size"]
+                decode_start_wall = time.monotonic()
                 for raw_rgb in stream_video_frames_in_memory(
-                    data, info, start_seconds=start_seconds, process_holder=proc_holder
+                    data, info, start_seconds=start_seconds, process_holder=proc_holder,
+                    decode_size=(decode_w, decode_h),
                 ):
                     if state["decoder_generation"] != generation or state["stopped"]:
                         return
+                    # Pace pushes to real time so the queue reflects "what should be on
+                    # screen now", not "everything ffmpeg could decode so far". This lets
+                    # the render loop simply show the newest queued frame without ever
+                    # racing ahead of the actual video timeline.
+                    target_wall = decode_start_wall + (t - start_seconds)
+                    sleep_for = target_wall - time.monotonic()
+                    if sleep_for > 0:
+                        time.sleep(min(sleep_for, frame_interval * 2))
                     try:
-                        state["frame_queue"].put((t, raw_rgb), timeout=2)
+                        state["frame_queue"].put((t, decode_w, decode_h, raw_rgb), timeout=2)
                     except queue.Full:
                         return
                     t += frame_interval
@@ -2325,11 +2517,12 @@ class VaultView(ctk.CTkFrame):
             )
             state["decoder_thread"] = thread
             thread.start()
-        def render_frame(raw_rgb: bytes) -> None:
-            img = Image.frombytes("RGB", (info.width, info.height), raw_rgb)
+        def render_frame(raw_rgb: bytes, frame_w: int, frame_h: int) -> None:
+            img = Image.frombytes("RGB", (frame_w, frame_h), raw_rgb)
             max_w = max(video_label.winfo_width(), 320)
             max_h = max(video_label.winfo_height(), 240)
-            img.thumbnail((max_w, max_h))
+            if frame_w > max_w or frame_h > max_h:
+                img.thumbnail((max_w, max_h), Image.BILINEAR)
             photo = ImageTk.PhotoImage(img)
             photo_refs.clear()
             photo_refs.append(photo)
@@ -2347,8 +2540,17 @@ class VaultView(ctk.CTkFrame):
                 return
             if state["playing"] and not state["seeking"]:
                 try:
-                    frame_time, raw_rgb = state["frame_queue"].get_nowait()
-                    render_frame(raw_rgb)
+                    frame_time, frame_w, frame_h, raw_rgb = state["frame_queue"].get_nowait()
+                    # Drain to the newest frame already sitting in the queue instead of
+                    # rendering stale ones we'd immediately have to catch up from — this
+                    # avoids ever "playing through" a backlog in slow motion.
+                    while True:
+                        try:
+                            newer = state["frame_queue"].get_nowait()
+                        except queue.Empty:
+                            break
+                        frame_time, frame_w, frame_h, raw_rgb = newer
+                    render_frame(raw_rgb, frame_w, frame_h)
                     state["current_frame_time"] = frame_time
                     if not state["seeking"]:
                         slider.set(min(frame_time, info.duration) if info.duration else 0)
@@ -2357,7 +2559,9 @@ class VaultView(ctk.CTkFrame):
                     if state["eof"] and state["frame_queue"].empty():
                         state["playing"] = False
                         play_pause_btn.configure(text="▶ Replay")
-            state["job"] = win.after(max(1, int(1000 / max(info.fps, 1))), pump)
+            # Poll frequently (independent of source fps) so a freshly-decoded frame is
+            # shown as soon as it's available rather than waiting a full frame interval.
+            state["job"] = win.after(8, pump)
         def toggle_play() -> None:
             if not state["playing"] and (
                 play_pause_btn.cget("text") == "▶ Replay" or state["audio_stopped"]
@@ -2375,8 +2579,18 @@ class VaultView(ctk.CTkFrame):
                 return
             state["playing"] = not state["playing"]
             if state["playing"]:
+                # Video decoding paces itself to wall-clock time; if we just leave the
+                # existing decoder running while paused, it silently keeps advancing and
+                # frames pile up "in the past" by the time we resume. Restarting from the
+                # current position keeps video and audio in sync after a pause.
+                resume_at = state["current_frame_time"]
+                start_decoder(resume_at)
                 if state["audio_session"] != -1:
-                    unpause_audio()
+                    try:
+                        state["audio_session"] = play_audio_in_memory(wav_audio, start_seconds=resume_at)
+                        set_audio_volume(state["volume"])
+                    except Exception:
+                        state["audio_session"] = -1
                 play_pause_btn.configure(text="⏸ Pause")
             else:
                 if state["audio_session"] != -1:
