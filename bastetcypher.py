@@ -161,6 +161,23 @@ def apply_app_icon(root):
             except Exception:
                 pass
     return photo
+def _secure_shred_file(path: str) -> None:
+    if not path or not os.path.exists(path):
+        return
+    try:
+        size = os.path.getsize(path)
+        if size > 0:
+            with open(path, "r+b") as f:
+                f.write(b'\x00' * size)
+                f.flush()
+                os.fsync(f.fileno())  
+    except Exception:
+        pass
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 def apply_screen_capture_protection(root) -> bool:
     system = platform.system()
     if system == "Windows":
@@ -548,7 +565,6 @@ def parse_bca(
             raise
         except Exception as exc:
             raise BCADecryptError(f"Layer 2 error: {exc}") from exc
-
         progress(45, "Layer 1 decryption...")
         try:
             aesgcm = AESGCM(bytes(k1))
@@ -725,18 +741,16 @@ def _video_input_source(data: bytes):
     finally:
         removed = False
         for attempt in range(5):
-            try:
-                os.remove(tmp_path)
+            if not os.path.exists(tmp_path):
                 removed = True
                 break
-            except OSError:
-                if attempt < 4:
-                    time.sleep(0.1)
+            _secure_shred_file(tmp_path)
+            if not os.path.exists(tmp_path):
+                removed = True
+                break
+            time.sleep(0.1)
         if not removed:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            _secure_shred_file(tmp_path)
 def probe_video_in_memory(data: bytes) -> VideoInfo:
     import re
     ffmpeg = _get_ffmpeg_exe()
@@ -762,7 +776,6 @@ def probe_video_in_memory(data: bytes) -> VideoInfo:
         if m:
             width, height = int(m.group(1)), int(m.group(2))
             break
-
     if width <= 0 or height <= 0:
         raise RuntimeError("Could not determine video dimensions.")
     fps = 25.0
@@ -1557,6 +1570,19 @@ class VaultView(ctk.CTkFrame):
             ).pack(side="left", padx=4)
     def _preview_entry(self, entry: VaultDecryptedEntry) -> None:
         kind = classify_extension(entry.name)
+        if kind == ViewerKind.VIDEO and _SYSTEM in ("Windows", "Darwin"):
+            proceed = messagebox.askyesno(
+                "Security Notice — Video Preview",
+                f"Notice regarding '{entry.name}':\n\n"
+                "On this operating system (Windows/macOS), video playback requires creating a temporary file on disk.\n\n"
+                "• While the file will be securely shredded with zeroes upon closing, data will briefly touch the disk.\n"
+                "• On Linux, playback runs 100% in RAM via /dev/shm.\n\n"
+                "Do you want to proceed with previewing this video?",
+                icon="warning",
+                parent=self
+            )
+            if not proceed:
+                return
         win = ctk.CTkToplevel(self)
         win.title(f"Preview — {entry.name}")
         win.geometry("800x700")
@@ -1814,7 +1840,6 @@ class VaultView(ctk.CTkFrame):
         def fmt(seconds: float) -> str:
             seconds = max(0, int(seconds))
             return f"{seconds // 60}:{seconds % 60:02d}"
-
         time_label.configure(text=f"0:00 / {fmt(info.duration)}")
         state = {
             "playing": True,
@@ -2012,10 +2037,7 @@ class VaultView(ctk.CTkFrame):
             status_label.configure(text=f"Could not open system player: {error_message}", text_color=DANGER)
         def on_close() -> None:
             if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+                _secure_shred_file(tmp_path)
                 if tmp_path in self._active_video_tmp_paths:
                     self._active_video_tmp_paths.remove(tmp_path)
             win.destroy()
@@ -2060,10 +2082,7 @@ class VaultView(ctk.CTkFrame):
         except Exception:
             pass
         for tmp_path in self._active_video_tmp_paths:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            _secure_shred_file(tmp_path)
         self._active_video_tmp_paths.clear()
 class BastetCipherApp(ctk.CTk):
     def __init__(self) -> None:
@@ -2141,7 +2160,6 @@ class BastetCipherApp(ctk.CTk):
         self.vault_view.open_pw_var.set(cipher)
         self.update_idletasks()
         self.vault_view.open_pw_entry.focus_set()
-
     def _on_close(self) -> None:
         try:
             self.vault_view.wipe_all_on_exit()
