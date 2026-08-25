@@ -148,6 +148,85 @@ def apply_app_icon(root):
         except Exception:
             pass
     return photo
+
+def apply_screen_capture_protection(root) -> bool:
+    system = platform.system()
+    if system == "Windows":
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = ctypes.c_void_p(int(root.winfo_id()))
+            set_affinity = user32.SetWindowDisplayAffinity
+            set_affinity.argtypes = [ctypes.c_void_p, ctypes.c_uint] 
+            set_affinity.restype = ctypes.c_bool
+            if set_affinity(hwnd, 0x11):
+                root._capture_protection = "WDA_EXCLUDEFROMCAPTURE"
+                return True
+            if set_affinity(hwnd, 0x01):
+                root._capture_protection = "WDA_MONITOR"
+                return True
+        except Exception:
+            pass
+        root._capture_protection = "unavailable"
+        return False
+    if system == "Darwin":
+        target = int(root.winfo_id())
+        try:
+            from AppKit import NSApp, NSWindowSharingNone
+            for window in NSApp().windows():
+                try:
+                    window_number = int(window.windowNumber())
+                except Exception:
+                    window_number = -1
+                try:
+                    content_view_id = int(window.contentView())
+                except Exception:
+                    content_view_id = -1
+                if target in (window_number, content_view_id):
+                    window.setSharingType_(NSWindowSharingNone)
+                    root._capture_protection = "NSWindowSharingNone"
+                    return True
+        except Exception:
+            pass
+        try:
+            objc = ctypes.CDLL(ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib")
+            objc.objc_getClass.argtypes = [ctypes.c_char_p]
+            objc.objc_getClass.restype = ctypes.c_void_p
+            objc.sel_registerName.argtypes = [ctypes.c_char_p]
+            objc.sel_registerName.restype = ctypes.c_void_p
+            msg_send_addr = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+            send_obj = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(msg_send_addr)
+            send_ulong = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(msg_send_addr)
+            send_index = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(msg_send_addr)
+            send_ptr = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(msg_send_addr)
+            send_set = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(msg_send_addr)
+            ns_app = send_obj(objc.objc_getClass(b"NSApplication"), objc.sel_registerName(b"sharedApplication"))
+            windows = send_obj(ns_app, objc.sel_registerName(b"windows"))
+            count = send_ulong(windows, objc.sel_registerName(b"count"))
+            window_number_sel = objc.sel_registerName(b"windowNumber")
+            content_view_sel = objc.sel_registerName(b"contentView")
+            set_sharing_sel = objc.sel_registerName(b"setSharingType:")
+            for index in range(count):
+                window = send_index(windows, objc.sel_registerName(b"objectAtIndex:"), index)
+                if not window:
+                    continue
+                window_number = send_ulong(window, window_number_sel)
+                content_view = send_ptr(window, content_view_sel)
+                if target in (int(window_number), int(content_view or 0)):
+                    send_set(window, set_sharing_sel, 0)
+                    root._capture_protection = "NSWindowSharingNone"
+                    return True
+        except Exception:
+            pass
+        root._capture_protection = "unavailable"
+        return False
+    if system == "Linux":
+        session = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+        if not session and os.environ.get("WAYLAND_DISPLAY"):
+            session = "wayland"
+        root._capture_protection = f"linux-{session or 'unknown'}-fallback"
+        return False
+    root._capture_protection = "unsupported"
+    return False
 MASK32 = 0xFFFFFFFF
 PEPPER = "Bastet_Secret_Temple_Key_\U00013060"
 RUNE_POOL = "𓃠𓂀𓊹𓆣𓇯𓋹𓅓𓁟𓆙𓊪𓏏𓎛"
@@ -1020,6 +1099,11 @@ class GeneratorView(ctk.CTkFrame):
             **Styled.secondary_button_kwargs(),
         )
         self.copy_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.open_vault_btn = ctk.CTkButton(
+            btn_row, text="🔒 Open in Vault", command=self._open_in_vault,
+            **Styled.secondary_button_kwargs(),
+        )
+        self.open_vault_btn.pack(side="left", expand=True, fill="x", padx=6)
         self.clear_btn = ctk.CTkButton(
             btn_row, text="🗑 Wipe from Memory", command=self._clear_output,
             **Styled.danger_button_kwargs(),
@@ -1114,6 +1198,12 @@ class GeneratorView(ctk.CTkFrame):
         self.clipboard_append(self._last_cipher)
         self.copy_btn.configure(text="✓ Copied!")
         self.after(1800, lambda: self.copy_btn.configure(text="📋 Copy to Clipboard"))
+    def _open_in_vault(self) -> None:
+        if not self._last_cipher:
+            return
+        app = self.winfo_toplevel()
+        if hasattr(app, "_open_cipher_in_vault"):
+            app._open_cipher_in_vault(self._last_cipher)
     def _clear_output(self) -> None:
         cipher_to_wipe = self._last_cipher
         self._last_cipher = ""
@@ -1325,13 +1415,13 @@ class VaultView(ctk.CTkFrame):
             anchor="w", padx=16, pady=(6, 4)
         )
         self.open_pw_var = tk.StringVar()
-        pw_entry = ctk.CTkEntry(
+        self.open_pw_entry = ctk.CTkEntry(
             t, textvariable=self.open_pw_var, show="•",
             placeholder_text="Password used to encrypt it...",
             **Styled.entry_kwargs(),
         )
-        pw_entry.pack(fill="x", padx=16)
-        pw_entry.bind("<Return>", lambda e: self._on_open_archive())
+        self.open_pw_entry.pack(fill="x", padx=16)
+        self.open_pw_entry.bind("<Return>", lambda e: self._on_open_archive())
         self.open_status = ctk.CTkLabel(t, text="", **Styled.label_muted_kwargs())
         self.open_status.pack(pady=(10, 0))
         self.open_progress = ctk.CTkProgressBar(t, progress_color=GOLD_BRIGHT, fg_color=INK)
@@ -1407,7 +1497,7 @@ class VaultView(ctk.CTkFrame):
         self._open_entries = entries
         self._render_entries_list()
         self.entries_frame.pack(fill="both", expand=True, padx=16, pady=(10, 6))
-        self.close_vault_btn.pack(side="bottom", fill="x", padx=16, pady=(0, 16))
+        self.close_vault_btn.pack(fill="x", padx=16, pady=(0, 16))
         self.entries_frame.update_idletasks()
     def _on_open_error(self, message: str) -> None:
         self.open_btn.configure(state="normal", text="🔓  Unlock Vault  🔓")
@@ -1972,6 +2062,8 @@ class BastetCipherApp(ctk.CTk):
         self.minsize(min_w, min_h)
         self.configure(fg_color=DEEP)
         self._build_layout()
+        self.update_idletasks()
+        apply_screen_capture_protection(self)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
     def _build_layout(self) -> None:
         sidebar_width = max(150, round(190 * CURRENT_UI_SCALE))
@@ -2017,6 +2109,15 @@ class BastetCipherApp(ctk.CTk):
         for k, btn in self.nav_buttons.items():
             btn.configure(fg_color=GOLD_DARK if k == key else "transparent")
         self.views[key].pack(fill="both", expand=True)
+    def _open_cipher_in_vault(self, cipher: str) -> None:
+        if not cipher:
+            return
+        self._show_view("vault")
+        self.vault_view.tabs.set("Open Archive")
+        self.vault_view.open_pw_var.set(cipher)
+        self.update_idletasks()
+        self.vault_view.open_pw_entry.focus_set()
+
     def _on_close(self) -> None:
         try:
             self.vault_view.wipe_all_on_exit()
