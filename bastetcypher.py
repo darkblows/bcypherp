@@ -1561,6 +1561,11 @@ class VaultView(ctk.CTkFrame):
         win.title(f"Preview — {entry.name}")
         win.geometry("800x700")
         win.configure(fg_color=DEEP)
+        win.attributes("-topmost", True)
+        win.after(150, lambda: [win.attributes("-topmost", False), win.focus_force()])
+        app = self.winfo_toplevel()
+        if hasattr(app, "_app_icon_photo"):
+            win.after(250, lambda: win.iconphoto(False, app._app_icon_photo))
         try:
             if kind == ViewerKind.IMAGE:
                 self._preview_image(win, bytes(entry.data))
