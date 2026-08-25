@@ -137,9 +137,11 @@ _APP_ICON_DATA = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADcAAABDCAMAAAAP
 def apply_app_icon(root):
     try:
         encoded = _APP_ICON_DATA.split(",", 1)[1]
-        photo = tk.PhotoImage(data=base64.b64encode(base64.b64decode(encoded, validate=True)).decode("ascii"))
+        raw_png = base64.b64decode(encoded, validate=True)
+        photo = tk.PhotoImage(data=base64.b64encode(raw_png).decode("ascii"))
     except Exception:
         photo = tk.PhotoImage(width=1, height=1)
+        raw_png = None
     root.iconphoto(True, photo)
     root._app_icon_photo = photo
     if sys.platform.startswith("win"):
@@ -147,8 +149,18 @@ def apply_app_icon(root):
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BastetCipher.SacredChamber")
         except Exception:
             pass
+        if raw_png is not None:
+            try:
+                import tempfile
+                img = Image.open(io.BytesIO(raw_png))
+                fd, temp_ico = tempfile.mkstemp(suffix=".ico")
+                os.close(fd)
+                img.save(temp_ico, format="ICO", sizes=[(64, 64)]) 
+                root.iconbitmap(temp_ico)
+                root.after(1000, lambda: os.remove(temp_ico) if os.path.exists(temp_ico) else None)
+            except Exception:
+                pass
     return photo
-
 def apply_screen_capture_protection(root) -> bool:
     system = platform.system()
     if system == "Windows":
@@ -891,6 +903,7 @@ def stop_audio() -> None:
     if pygame.mixer.get_init():
         pygame.mixer.music.stop()
 GOLD = "#c9a84c"
+CUSTOMGOLD = "#544A00"
 GOLD_BRIGHT = "#f0c040"
 GOLD_DARK = "#7a5c1e"
 STONE = "#2a2318"
@@ -1235,12 +1248,18 @@ class VaultView(ctk.CTkFrame):
             text="AES-256-GCM · AES-256-CBC · PBKDF2-HMAC-SHA512 · deflate-raw · All in RAM",
             **Styled.label_muted_kwargs(),
         ).pack(pady=(0, 18))
-
         self.tabs = ctk.CTkTabview(
-            self, fg_color=STONE, segmented_button_selected_color=GOLD_DARK,
-            segmented_button_selected_hover_color=GOLD,
-            segmented_button_fg_color=INK, text_color=SAND,
+            self, 
+            fg_color=STONE, 
+            segmented_button_selected_color=GOLD_DARK,
+            segmented_button_selected_hover_color=CUSTOMGOLD,
+            segmented_button_fg_color=INK, 
+            segmented_button_unselected_color=STONE_MID,
+            segmented_button_unselected_hover_color=STONE_LIGHT,
+            text_color=SAND,
         )
+        self.tabs._segmented_button.configure(font=FONT_BUTTON, height=45) 
+        self.tabs.pack(padx=24, pady=8, fill="both", expand=True)
         self.tabs.pack(padx=24, pady=8, fill="both", expand=True)
         self.tab_create = self.tabs.add("Create Archive")
         self.tab_open = self.tabs.add("Open Archive")
@@ -2086,7 +2105,7 @@ class BastetCipherApp(ctk.CTk):
             text_color=SAND if memory_lock_available() else "#ff9a5a",
             wraplength=160, justify="center",
         ).pack(side="bottom", pady=16, padx=10)
-        self.content = ctk.CTkFrame(self, fg_color=DEEP, corner_radius=0)
+        self.content = ctk.CTkScrollableFrame(self, fg_color=DEEP, corner_radius=0)
         self.content.pack(side="left", fill="both", expand=True)
         self.views: dict[str, ctk.CTkFrame] = {}
         self.generator_view = GeneratorView(self.content)
