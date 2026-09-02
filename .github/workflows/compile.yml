@@ -13,11 +13,13 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            icon: icon.png
             suffix: macos
+            binary_name: bastetcypher
+            target_name: bastetcypher-macos
           - os: windows-latest
-            icon: icon.ico
             suffix: windows
+            binary_name: bastetcypher.exe
+            target_name: bastetcypher-windows.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -28,34 +30,39 @@ jobs:
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11' 
+        python-version: '3.11'
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pillow pyinstaller
+        pip install pyinstaller
         pip install -r requirements.txt
 
-    - name: Compile with PyInstaller
-      shell: bash
+    - name: Compile with PyInstaller (Windows)
+      if: matrix.os == 'windows-latest'
       run: |
-        pyinstaller --onefile --icon=${{ matrix.icon }} bastetcypher.py
+        # --noconsole nasconde il prompt nero del terminale
+        # --collect-all imageio_ffmpeg include l'eseguibile di ffmpeg dentro il file .exe
+        pyinstaller --onefile --noconsole --collect-all imageio_ffmpeg --collect-all pymupdf --icon=icon.ico bastetcypher.py
 
-    - name: Rename executables
+    - name: Compile with PyInstaller (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        # Se possiedi icon.icns puoi aggiungere: --icon=icon.icns
+        pyinstaller --onefile --noconsole --collect-all imageio_ffmpeg --collect-all pymupdf bastetcypher.py
+
+    - name: Prepare and rename executables
       shell: bash
       run: |
         cd dist
-        if [ "${{ matrix.os }}" = "windows-latest" ]; then
-          mv bastetcypher.exe bastetcypher-windows.exe
-        elif [ "${{ matrix.os }}" = "macos-latest" ]; then
-          mv bastetcypher bastetcypher-macos
-        fi
+        mv "${{ matrix.binary_name }}" "${{ matrix.target_name }}"
+        chmod +x "${{ matrix.target_name }}"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: bastetcypher-${{ matrix.suffix }}
-        path: dist/*
+        path: dist/${{ matrix.target_name }}
 
   release:
     needs: build
@@ -72,8 +79,9 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: autopublished
-        name: "BastetCypher - Autopublished"
-        body: "Automatically populate the latest update."
+        name: "BastetCipher - Latest Release"
+        body: "Automated multi-platform build for Windows and macOS."
         files: artifacts/*
+        make_latest: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
