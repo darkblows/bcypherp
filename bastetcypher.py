@@ -3554,6 +3554,7 @@ class BastetCipherApp(ctk.CTk):
             self._node_photo_cache[("emblem", False)] = self._render_emblem_photo(emblem_size)
 
         cy = h * 0.52
+        emblem_cy = h * 0.34
         total_w = node_size * 2 + emblem_size + gap * 2
         start_x = (w - total_w) / 2
 
@@ -3589,13 +3590,13 @@ class BastetCipherApp(ctk.CTk):
         emb_cx = start_x + node_size + gap + emblem_size / 2
         emb_photo = self._node_photo_cache[("emblem", False)]
         self._hub_photo_refs.append(emb_photo)
-        canvas.create_image(emb_cx, cy, image=emb_photo, anchor="center")
+        canvas.create_image(emb_cx, emblem_cy, image=emb_photo, anchor="center")
         canvas.create_text(
-            emb_cx, cy - emblem_size * 0.06, text="𓃠", #0.66
+            emb_cx, emblem_cy - emblem_size * 0.06, text="𓃠", #0.66
             font=("Segoe UI Symbol", emb_icon_size), fill=TEMPLE_GOLD_SUN
         )
         canvas.create_text(
-            emb_cx, cy + emblem_size * 0.32, text="\n",
+            emb_cx, emblem_cy + emblem_size * 0.32, text="\n",
             font=("Georgia", emb_label_size, "bold"), fill=TEMPLE_GOLD_BRONZE,
             justify="center"
         )
