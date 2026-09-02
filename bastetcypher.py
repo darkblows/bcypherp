@@ -315,7 +315,7 @@ def apply_screen_capture_protection(root) -> bool:
         session = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
         if not session and os.environ.get("WAYLAND_DISPLAY"):
             session = "wayland"
-        root._capture_protection = f"linux-{session or "unknown"}-fallback"
+        root._capture_protection = f"linux-{session or 'unknown'}-fallback"
         return False
     root._capture_protection = "unsupported"
     return False
