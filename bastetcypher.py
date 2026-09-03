@@ -13,9 +13,10 @@ import zlib
 import io
 import contextlib
 import re
+import gc
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -468,20 +469,27 @@ class BCAFormatError(ValueError):
     pass
 class BCADecryptError(ValueError):
     pass
-def crc32(data: "bytes | bytearray") -> int:
+def crc32(data: "bytes | bytearray | memoryview") -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
-def deflate_raw_compress(data: "bytes | bytearray") -> bytes:
-    co = zlib.compressobj(level=9, wbits=-15)
-    out = co.compress(data) + co.flush()
-    return out
-def deflate_raw_decompress(data: bytes) -> bytes:
-    do = zlib.decompressobj(wbits=-15)
-    out = do.decompress(data)
-    out += do.flush()
-    if not do.eof or do.unused_data or do.unconsumed_tail:
-        raise BCAFormatError("Compressed entry has an invalid or trailing deflate stream.")
-    return out
-def derive_vault_keys(password: bytearray, salt: bytes, iterations: int) -> tuple[bytearray, bytearray]:
+def deflate_raw_compress(data: "bytes | bytearray | memoryview") -> bytes:
+    try:
+        mv = memoryview(data) if not isinstance(data, (bytes, bytearray)) else data
+        co = zlib.compressobj(level=9, wbits=-15)
+        out = co.compress(mv) + co.flush()
+        return out
+    except MemoryError:
+        raise MemoryError("Insufficient memory while compressing vault entry.") from None
+def deflate_raw_decompress(data: "bytes | bytearray | memoryview") -> bytes:
+    try:
+        do = zlib.decompressobj(wbits=-15)
+        out = do.decompress(data)
+        out += do.flush()
+        if not do.eof or do.unused_data or do.unconsumed_tail:
+            raise BCAFormatError("Compressed entry has an invalid or trailing deflate stream.")
+        return out
+    except MemoryError:
+        raise MemoryError("Insufficient memory while decompressing vault entry.") from None
+def derive_vault_keys(password: bytearray, salt: bytes, iterations: int) -> Tuple[bytearray, bytearray]:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA512(),
         length=64,
@@ -492,6 +500,11 @@ def derive_vault_keys(password: bytearray, salt: bytes, iterations: int) -> tupl
     derived = kdf.derive(bytes(password))
     k1 = bytearray(derived[0:32])
     k2 = bytearray(derived[32:64])
+    if isinstance(derived, (bytes, bytearray)):
+        try:
+            wipe_bytearray(bytearray(derived))
+        except Exception:
+            pass
     del derived
     return k1, k2
 @dataclass
@@ -515,6 +528,8 @@ def build_bca(
     progress(5, "Deriving 512-bit keys...")
     k1, k2 = derive_vault_keys(password, salt, BCA_ITERS)
     progress(22, "Keys ready · Isolated cascade")
+    plaintext: Optional[bytearray] = None
+    ct1: Optional[bytes] = None
     try:
         parts: List[bytes] = [struct.pack("<H", len(file_entries) & 0xFFFF)]
         for i, entry in enumerate(file_entries):
@@ -524,8 +539,8 @@ def build_bca(
             )
             try:
                 name_bytes = entry.name.encode("utf-8")
-                compressed = deflate_raw_compress(entry.data)
-                crc = crc32(entry.data)
+                compressed = deflate_raw_compress(memoryview(entry.data))
+                crc = crc32(memoryview(entry.data))
                 parts.append(struct.pack("<H", len(name_bytes)))
                 parts.append(name_bytes)
                 parts.append(struct.pack("<I", crc))
@@ -540,8 +555,11 @@ def build_bca(
         aesgcm = AESGCM(bytes(k1))
         ct1 = aesgcm.encrypt(iv1, plaintext, None)
         wipe_bytearray(plaintext)
+        plaintext = None
         progress(85, "Layer 2 encryption (CBC)...")
         ct2 = _aes_cbc_encrypt(bytes(k2), iv2, ct1)
+        del ct1
+        ct1 = None
         progress(92, "Finalizing and wiping RAM residuals...")
         header = (
             BCA_MAGIC
@@ -551,22 +569,41 @@ def build_bca(
             + iv1
             + iv2
         )
-        return bytearray(header + ct2)
+        result = bytearray(header + ct2)
+        del ct2
+        return result
+    except MemoryError:
+        if plaintext is not None:
+            wipe_bytearray(plaintext)
+        if ct1 is not None and isinstance(ct1, (bytearray, bytes)):
+            try:
+                wipe_bytearray(bytearray(ct1))
+            except Exception:
+                pass
+        gc.collect()
+        raise MemoryError(
+            "Out of memory while building the archive. "
+            "Try fewer / smaller files or close other applications."
+        ) from None
     finally:
         wipe_bytearray(k1)
         wipe_bytearray(k2)
         for entry in file_entries:
             wipe_bytearray(entry.data)
-def _aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+        gc.collect()
+def _aes_cbc_encrypt(key: bytes, iv: bytes, data: "bytes | bytearray | memoryview") -> bytes:
     pad_len = 16 - (len(data) % 16)
-    padded = bytearray(data)
+    if isinstance(data, memoryview):
+        padded = bytearray(data.tobytes())
+    else:
+        padded = bytearray(data)
     padded.extend(bytes([pad_len]) * pad_len)
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
     result = encryptor.update(padded) + encryptor.finalize()
     wipe_bytearray(padded)
     return result
-def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+def _aes_cbc_decrypt(key: bytes, iv: bytes, data: "bytes | bytearray | memoryview") -> bytes:
     if len(data) % 16 != 0:
         raise BCADecryptError("Invalid ciphertext length.")
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
@@ -597,14 +634,18 @@ def parse_bca(
         raise BCAFormatError("Invalid PBKDF2 parameter for this archive.")
     iv1 = bytes(d[41:53])
     iv2 = bytes(d[53:69])
-    ct = d[69:]
+    ct_view = memoryview(d)[69:]
     progress(10, "Re-deriving 512-bit keys...")
     k1, k2 = derive_vault_keys(password, salt, iterations)
+    plain: Optional[bytearray] = None
+    ct1: Optional[bytes] = None
     try:
         progress(30, "Layer 2 decryption...")
         try:
-            ct1 = _aes_cbc_decrypt(bytes(k2), iv2, ct)
+            ct1 = _aes_cbc_decrypt(bytes(k2), iv2, ct_view)
         except BCADecryptError:
+            raise
+        except MemoryError:
             raise
         except Exception as exc:
             raise BCADecryptError(f"Layer 2 error: {exc}") from exc
@@ -612,10 +653,14 @@ def parse_bca(
         try:
             aesgcm = AESGCM(bytes(k1))
             plain = bytearray(aesgcm.decrypt(iv1, ct1, None))
+        except MemoryError:
+            raise
         except Exception as exc:
             raise BCADecryptError(
                 "Layer 1 error: wrong password or tampered file (authenticity check failed)."
             ) from exc
+        del ct1
+        ct1 = None
         progress(54, "Analyzing structure...")
         entries: List[VaultDecryptedEntry] = []
         try:
@@ -644,11 +689,17 @@ def parse_bca(
                 comp_size = struct.unpack_from("<I", plain, pos)[0]
                 pos += 4
                 require_bytes(comp_size, "the compressed file data")
-                compressed = bytes(plain[pos : pos + comp_size])
+                compressed_mv = memoryview(plain)[pos : pos + comp_size]
                 pos += comp_size
                 progress(54 + int(18 * i / max(1, file_count)), f"Verifying: {name}")
-                decompressed = bytearray(deflate_raw_decompress(compressed))
-                crc_actual = crc32(bytes(decompressed))
+                try:
+                    decompressed = bytearray(deflate_raw_decompress(compressed_mv))
+                except MemoryError:
+                    raise MemoryError(
+                        f"Out of memory while decompressing '{name}'. "
+                        "The archive may contain very large files."
+                    ) from None
+                crc_actual = crc32(memoryview(decompressed))
                 if len(decompressed) != orig_size:
                     crc_ok = False
                 else:
@@ -661,13 +712,29 @@ def parse_bca(
                 wipe_bytearray(leaked_entry.data)
             raise
         finally:
-            wipe_bytearray(plain)
+            if plain is not None:
+                wipe_bytearray(plain)
+                plain = None
         progress(72, "Vault unlocked.")
         return entries
+    except MemoryError:
+        if plain is not None:
+            wipe_bytearray(plain)
+        if ct1 is not None and isinstance(ct1, (bytearray, bytes)):
+            try:
+                wipe_bytearray(bytearray(ct1))
+            except Exception:
+                pass
+        gc.collect()
+        raise MemoryError(
+            "Out of memory while unlocking the vault. "
+            "Close other applications or try a smaller archive."
+        ) from None
     finally:
         wipe_bytearray(k1)
         wipe_bytearray(k2)
         wipe_bytearray(buffer)
+        gc.collect()
 class ViewerKind(Enum):
     IMAGE = auto()
     PDF = auto()
@@ -747,6 +814,125 @@ def render_pdf_pages_in_memory(
     finally:
         doc.close()
     return pages
+class LazyPDFDocument:
+    def __init__(self, data: bytes, dpi: int = 120):
+        import fitz
+        self._fitz = fitz
+        self._doc = fitz.open(stream=data, filetype="pdf")
+        self._dpi = dpi
+        self._zoom = dpi / 72.0
+        self._matrix = fitz.Matrix(self._zoom, self._zoom)
+        self._cache: dict[Tuple[int, str], Tuple[QPixmap, int, int]] = {}
+        self._cache_order: List[Tuple[int, str]] = []
+        self._max_cache = 3
+        self._text_cache: dict[int, str] = {}
+    @property
+    def page_count(self) -> int:
+        return self._doc.page_count
+    def get_page_text(self, index: int) -> str:
+        if index < 0 or index >= self.page_count:
+            return ""
+        if index in self._text_cache:
+            return self._text_cache[index]
+        page = self._doc.load_page(index)
+        text = page.get_text("text") or ""
+        if not text.strip():
+            try:
+                blocks = page.get_text("blocks") or []
+                parts = []
+                for b in blocks:
+                    if isinstance(b, (list, tuple)) and len(b) >= 5 and isinstance(b[4], str):
+                        parts.append(b[4])
+                text = "\n".join(parts)
+            except Exception:
+                pass
+        self._text_cache[index] = text
+        return text
+    def page_has_match(self, index: int, query: str) -> bool:
+        q = (query or "").strip()
+        if not q or index < 0 or index >= self.page_count:
+            return False
+        page = self._doc.load_page(index)
+        try:
+            hits = page.search_for(q, quads=False)
+            if hits:
+                return True
+        except Exception:
+            pass
+        try:
+            return q.casefold() in self.get_page_text(index).casefold()
+        except Exception:
+            return False
+    def find_matching_pages(self, query: str) -> List[int]:
+        q = (query or "").strip()
+        if not q:
+            return []
+        matches: List[int] = []
+        for i in range(self.page_count):
+            if self.page_has_match(i, q):
+                matches.append(i)
+        return matches
+    def _render_with_highlights(self, page, query: str):
+        fitz = self._fitz
+        annots_added = []
+        q = (query or "").strip()
+        if q:
+            try:
+                for rect in page.search_for(q, quads=False) or []:
+                    try:
+                        annot = page.add_highlight_annot(rect)
+                        annot.set_colors(stroke=(1.0, 0.92, 0.2))
+                        annot.set_opacity(0.45)
+                        annot.update()
+                        annots_added.append(annot)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        try:
+            pix = page.get_pixmap(matrix=self._matrix, alpha=False)
+        finally:
+            for annot in annots_added:
+                try:
+                    page.delete_annot(annot)
+                except Exception:
+                    pass
+        return pix
+    def render_page(
+        self, index: int, highlight_query: str = ""
+    ) -> Tuple[QPixmap, int, int]:
+        if index < 0 or index >= self.page_count:
+            raise IndexError("page out of range")
+        hq = (highlight_query or "").strip()
+        key = (index, hq.casefold())
+        if key in self._cache:
+            try:
+                self._cache_order.remove(key)
+            except ValueError:
+                pass
+            self._cache_order.append(key)
+            return self._cache[key]
+        page = self._doc.load_page(index)
+        pix = self._render_with_highlights(page, hq)
+        png_bytes = pix.tobytes("png")
+        qimg = QImage.fromData(png_bytes, "PNG")
+        pixmap = QPixmap.fromImage(qimg)
+        result = (pixmap, pix.width, pix.height)
+        self._cache[key] = result
+        self._cache_order.append(key)
+        while len(self._cache_order) > self._max_cache:
+            old = self._cache_order.pop(0)
+            self._cache.pop(old, None)
+        return result
+    def close(self) -> None:
+        self._cache.clear()
+        self._cache_order.clear()
+        self._text_cache.clear()
+        try:
+            self._doc.close()
+        except Exception:
+            pass
+        gc.collect()
 def decode_text_in_memory(data: bytes) -> str:
     try:
         return data.decode("utf-8")
@@ -870,9 +1056,20 @@ def probe_video_in_memory(data: bytes) -> VideoInfo:
             duration = 0.0
     has_audio = bool(re.search(r"Stream.*Audio:", text))
     return VideoInfo(width=width, height=height, fps=fps, duration=duration, has_audio=has_audio)
-def _fit_decode_size(src_w: int, src_h: int, target_w: int, target_h: int) -> tuple[int, int]:
+def _fit_decode_size(
+    src_w: int,
+    src_h: int,
+    target_w: int,
+    target_h: int,
+    max_long_side: int = 1920,
+) -> tuple[int, int]:
     if target_w <= 0 or target_h <= 0 or src_w <= 0 or src_h <= 0:
         return src_w, src_h
+    long_side = max(src_w, src_h)
+    if long_side > max_long_side:
+        cap_scale = max_long_side / long_side
+        src_w = max(2, int(src_w * cap_scale) // 2 * 2)
+        src_h = max(2, int(src_h * cap_scale) // 2 * 2)
     if src_w <= target_w and src_h <= target_h:
         return src_w, src_h
     scale = min(target_w / src_w, target_h / src_h)
@@ -895,7 +1092,7 @@ def stream_video_frames_in_memory(
             cmd += ["-ss", f"{start_seconds:.3f}"]
         vf = f"fps={info.fps}"
         if (out_w, out_h) != (info.width, info.height):
-            vf += f",scale={out_w}:{out_h}:flags=fast_bilinear"
+            vf += f",scale={out_w}:{out_h}:flags=bilinear"
         cmd += [
             "-i", video_path,
             "-map", "0:v:0",
@@ -904,8 +1101,10 @@ def stream_video_frames_in_memory(
             "pipe:1",
         ]
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            bufsize=frame_size * 2,
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=frame_size,  # ~1 frame
         )
         if process_holder is not None:
             process_holder.append(proc)
@@ -917,14 +1116,19 @@ def stream_video_frames_in_memory(
                 yield chunk
         finally:
             try:
-                proc.stdout.close()
+                if proc.stdout:
+                    proc.stdout.close()
             except OSError:
                 pass
             try:
-                proc.kill()
+                if proc.poll() is None:
+                    proc.kill()
             except OSError:
                 pass
-            proc.wait(timeout=5)
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
 def extract_video_audio_as_wav(data: bytes) -> Optional[bytes]:
     ffmpeg = _get_ffmpeg_exe()
     with _video_input_source(data) as video_path:
@@ -1605,40 +1809,82 @@ class VideoDecodeThread(QThread):
     frameReady = Signal(float, int, int, bytes)
     finishedDecoding = Signal()
     failed = Signal(str)
-    def __init__(self, data: bytes, info: VideoInfo, start_seconds: float, decode_size: tuple[int, int], parent=None):
+    def __init__(
+        self,
+        data: bytes,
+        info: VideoInfo,
+        start_seconds: float,
+        decode_size: tuple[int, int],
+        parent=None,
+    ):
         super().__init__(parent)
         self.data = data
         self.info = info
         self.start_seconds = start_seconds
         self.decode_size = decode_size
-        self._process_holder = []
+        self._process_holder: list = []
+        self._pending_frames = 0
+        self._max_pending = 2
     def request_stop(self):
         self.requestInterruption()
         try:
             if self._process_holder:
-                self._process_holder[0].kill()
+                proc = self._process_holder[0]
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
         except Exception:
             pass
+    def notify_frame_consumed(self):
+        if self._pending_frames > 0:
+            self._pending_frames -= 1
     def run(self):
         try:
             interval = 1.0 / self.info.fps if self.info.fps > 0 else 0.04
             t = self.start_seconds
             wall = time.monotonic()
             for raw_rgb in stream_video_frames_in_memory(
-                self.data, self.info, start_seconds=self.start_seconds,
-                process_holder=self._process_holder, decode_size=self.decode_size
+                self.data,
+                self.info,
+                start_seconds=self.start_seconds,
+                process_holder=self._process_holder,
+                decode_size=self.decode_size,
             ):
                 if self.isInterruptionRequested():
                     return
+                if self._pending_frames >= self._max_pending:
+                    t += interval
+                    continue
                 target = wall + (t - self.start_seconds)
                 sleep_for = target - time.monotonic()
                 if sleep_for > 0:
                     time.sleep(min(sleep_for, interval * 2))
-                self.frameReady.emit(t, self.decode_size[0], self.decode_size[1], raw_rgb)
+                self._pending_frames += 1
+                self.frameReady.emit(
+                    t, self.decode_size[0], self.decode_size[1], raw_rgb
+                )
                 t += interval
             self.finishedDecoding.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            try:
+                if self._process_holder:
+                    proc = self._process_holder[0]
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._process_holder.clear()
 def _pixmap_from_pil(img: Image.Image) -> QPixmap:
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA")
@@ -2358,20 +2604,38 @@ class VaultView(QWidget):
         self.create_progress.setValue(pct)
         self.create_status.setText(msg)
     @Slot(object)
-    def _on_create_success(self,path):
+    def _on_create_success(self, path):
         self.create_spinner.stop()
         self.create_progress.hide()
         self.create_pw_entry.clear()
         self.create_pw_confirm_entry.clear()
-        self._set_busy(self.create_spinner,[self.create_pw_entry,self.create_pw_confirm_entry,self.create_btn,self.add_files_btn],False)
+        self._set_busy(
+            self.create_spinner,
+            [self.create_pw_entry, self.create_pw_confirm_entry, self.create_btn, self.add_files_btn],
+            False,
+        )
         self.create_status.setText(f"✓ Archive created: {path}")
         self.create_status.setStyleSheet(f"color:{TEMPLE_EMERALD};")
+        gc.collect()
+
     @Slot(str)
-    def _on_create_error(self,message):
+    def _on_create_error(self, message):
         self.create_spinner.stop()
         self.create_progress.hide()
-        self._set_busy(self.create_spinner,[self.create_pw_entry,self.create_pw_confirm_entry,self.create_btn,self.add_files_btn],False)
-        QMessageBox.critical(self,"Archive creation failed",message)
+        self._set_busy(
+            self.create_spinner,
+            [self.create_pw_entry, self.create_pw_confirm_entry, self.create_btn, self.add_files_btn],
+            False,
+        )
+        if "Out of memory" in message or "MemoryError" in message:
+            QMessageBox.critical(
+                self,
+                "Archive creation failed",
+                "Out of memory while building the archive.\n"
+                "Try fewer / smaller files or close other applications.",
+            )
+        else:
+            QMessageBox.critical(self, "Archive creation failed", message)
     def _choose_bca_file(self):
         path,_=QFileDialog.getOpenFileName(self,"Select .bca archive",filter="BastetCipher Archive (*.bca);;All files (*)")
         if not path:
@@ -2414,22 +2678,33 @@ class VaultView(QWidget):
         self.open_progress.setValue(pct)
         self.open_status.setText(msg)
     @Slot(object)
-    def _on_open_success(self,entries):
+    def _on_open_success(self, entries):
         self.open_spinner.stop()
         self.open_progress.hide()
-        self._set_busy(self.open_spinner,[self.open_pw_entry,self.open_btn],False)
-        self._open_entries=entries
-        self.open_status.setText(f"✓ Vault unlocked · {len(entries)} file(s) · data only in RAM")
+        self._set_busy(self.open_spinner, [self.open_pw_entry, self.open_btn], False)
+        self._open_entries = entries
+        self.open_status.setText(
+            f"✓ Vault unlocked · {len(entries)} file(s) · data only in RAM"
+        )
         self.open_status.setStyleSheet(f"color:{TEMPLE_EMERALD};")
         self._render_entries_list()
         self.entries_card.show()
+        gc.collect()
     @Slot(str)
-    def _on_open_error(self,message):
+    def _on_open_error(self, message):
         self.open_spinner.stop()
         self.open_progress.hide()
-        self._set_busy(self.open_spinner,[self.open_pw_entry,self.open_btn],False)
-        friendly = "Wrong password or corrupted/tampered archive." if ("Layer 1" in message or "Layer 2" in message) else message
-        QMessageBox.critical(self,"Vault",friendly)
+        self._set_busy(self.open_spinner, [self.open_pw_entry, self.open_btn], False)
+        if "Out of memory" in message or "MemoryError" in message:
+            friendly = (
+                "Out of memory while unlocking the vault.\n"
+                "Close other applications or try a smaller archive."
+            )
+        elif "Layer 1" in message or "Layer 2" in message:
+            friendly = "Wrong password or corrupted/tampered archive."
+        else:
+            friendly = message
+        QMessageBox.critical(self, "Vault", friendly)
     def _render_entries_list(self):
         while self.entries_layout.count():
             item=self.entries_layout.takeAt(0)
@@ -2535,7 +2810,6 @@ class VaultView(QWidget):
                 zoom_label.setText(f"Zoom: {round(state['scale']*100)}%{suffix}")
             except Exception:
                 pass
-
         def change(f):
             state["scale"]=max(0.05,min(8.0,state["scale"]*f))
             render()
@@ -2559,93 +2833,179 @@ class VaultView(QWidget):
                 delay=100
             timer.start(delay)
             state["timer"]=timer
-    def _preview_pdf(self,dialog,data):
-        root=QVBoxLayout(dialog)
-        loading=QLabel("◐  Rendering PDF securely in memory...")
+    def _preview_pdf(self, dialog, data):
+        root = QVBoxLayout(dialog)
+        loading = QLabel("◐  Opening PDF securely in memory...")
         loading.setAlignment(Qt.AlignCenter)
-        loading.setFont(_font(14,"Georgia",False,True))
+        loading.setFont(_font(14, "Georgia", False, True))
         loading.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
-        root.addWidget(loading,1)
+        root.addWidget(loading, 1)
         def worker(_progress):
-            return render_pdf_pages_in_memory(data,dpi=100,max_pages=30)
-        t=TaskThread(worker,dialog)
-        def success(pages):
+            return LazyPDFDocument(data, dpi=120)
+        t = TaskThread(worker, dialog)
+        def success(lazy_doc: "LazyPDFDocument"):
             while root.count():
-                item=root.takeAt(0)
-                w=item.widget()
-                if w: w.deleteLater()
-            toolbar=QHBoxLayout()
-            search=QLineEdit()
+                item = root.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+            page_count = lazy_doc.page_count
+            state = {
+                "page": 0,
+                "zoom": 1.0,
+                "matches": [],
+                "match_idx": 0,
+                "last_query": "",
+            }
+            toolbar = QHBoxLayout()
+            search = QLineEdit()
             search.setPlaceholderText("Search text in PDF...")
-            find_btn=QPushButton("FIND")
-            prev_btn=QPushButton("‹")
-            next_btn=QPushButton("›")
-            zoom_out=QPushButton("−")
-            zoom_in=QPushButton("+")
-            match=QLabel(f"Page 1 / {max(1,len(pages))}")
-            toolbar.addWidget(search,1)
-            toolbar.addWidget(find_btn); toolbar.addWidget(prev_btn); toolbar.addWidget(next_btn)
-            toolbar.addStretch(1); toolbar.addWidget(zoom_out); toolbar.addWidget(zoom_in); toolbar.addWidget(match)
+            find_btn = QPushButton("FIND")
+            prev_btn = QPushButton("‹")
+            next_btn = QPushButton("›")
+            zoom_out = QPushButton("−")
+            zoom_in = QPushButton("+")
+            page_label = QLabel(f"Page 1 / {max(1, page_count)}")
+            toolbar.addWidget(search, 1)
+            toolbar.addWidget(find_btn)
+            toolbar.addWidget(prev_btn)
+            toolbar.addWidget(next_btn)
+            toolbar.addStretch(1)
+            toolbar.addWidget(zoom_out)
+            toolbar.addWidget(zoom_in)
+            toolbar.addWidget(page_label)
             root.addLayout(toolbar)
-            scroll=QScrollArea()
+            scroll = QScrollArea()
             scroll.setWidgetResizable(True)
-            cont=QWidget()
-            lay=QVBoxLayout(cont)
-            lay.setAlignment(Qt.AlignHCenter|Qt.AlignTop)
-            scroll.setWidget(cont)
-            root.addWidget(scroll,1)
-            zoom={"v":1.0}
-            page_labels=[]
-            for page in pages:
-                frame=GlowFrame(accent=TEMPLE_GOLD_BRONZE,radius=12)
-                fl=QVBoxLayout(frame)
-                img=QLabel()
-                img.setAlignment(Qt.AlignCenter)
-                base=QImage.fromData(page.png_bytes,"PNG")
-                img.setPixmap(QPixmap.fromImage(base))
-                fl.addWidget(img)
-                cap=QLabel(f"Page {page.index+1}")
-                cap.setAlignment(Qt.AlignCenter)
-                cap.setStyleSheet(f"color:{TEMPLE_GOLD_BRONZE};")
-                fl.addWidget(cap)
-                lay.addWidget(frame)
-                page_labels.append((img,base))
-            search_state={"matches":[],"idx":0}
-            def apply_zoom():
-                for img,base in page_labels:
-                    img.setPixmap(QPixmap.fromImage(base).scaled(
-                        int(base.width()*zoom["v"]),int(base.height()*zoom["v"]),
-                        Qt.KeepAspectRatio,Qt.SmoothTransformation
-                    ))
-                match.setText(f"Zoom {round(zoom['v']*100)}%")
-            def do_zoom(f):
-                zoom["v"]=max(.5,min(2.0,zoom["v"]*f)); apply_zoom()
-            zoom_in.clicked.connect(lambda:do_zoom(1.2))
-            zoom_out.clicked.connect(lambda:do_zoom(1/1.2))
-            def find_text(direction=0):
-                q=search.text().strip().casefold()
-                if not q:
-                    search_state["matches"]=[]; search_state["idx"]=0; match.setText(f"Page 1 / {max(1,len(pages))}"); return
-                matches=[p.index for p in pages if q in p.text.casefold()]
-                if matches != search_state["matches"]:
-                    search_state["matches"]=matches; search_state["idx"]=0
-                elif matches:
-                    search_state["idx"]=(search_state["idx"]+direction)%len(matches)
-                if not matches:
-                    match.setText("No matches"); return
-                idx=search_state["matches"][search_state["idx"]]
-                match.setText(f"Match {search_state['idx']+1} / {len(matches)}  ·  page {idx+1}")
-                bar=scroll.verticalScrollBar()
-                target_widget=lay.itemAt(idx).widget()
-                if target_widget:
-                    scroll.ensureWidgetVisible(target_widget)
-            find_btn.clicked.connect(lambda:find_text(0)); prev_btn.clicked.connect(lambda:find_text(-1)); next_btn.clicked.connect(lambda:find_text(1))
-            search.returnPressed.connect(lambda:find_text(1))
+            page_frame = GlowFrame(accent=TEMPLE_GOLD_BRONZE, radius=12)
+            page_layout = QVBoxLayout(page_frame)
+            page_layout.setContentsMargins(12, 12, 12, 12)
+            img_label = QLabel()
+            img_label.setAlignment(Qt.AlignCenter)
+            img_label.setStyleSheet(f"background:{TEMPLE_BG};")
+            page_layout.addWidget(img_label)
+            cap = QLabel("Page 1")
+            cap.setAlignment(Qt.AlignCenter)
+            cap.setStyleSheet(f"color:{TEMPLE_GOLD_BRONZE};")
+            page_layout.addWidget(cap)
+            scroll.setWidget(page_frame)
+            root.addWidget(scroll, 1)
+            def show_page(idx: int, update_status: bool = True):
+                idx = max(0, min(page_count - 1, idx))
+                state["page"] = idx
+                hq = state.get("last_query") or ""
+                try:
+                    pixmap, w, h = lazy_doc.render_page(idx, highlight_query=hq)
+                    if idx + 1 < page_count:
+                        try:
+                            lazy_doc.render_page(idx + 1, highlight_query=hq)
+                        except Exception:
+                            pass
+                    if state["zoom"] != 1.0:
+                        scaled = pixmap.scaled(
+                            int(w * state["zoom"]),
+                            int(h * state["zoom"]),
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation,
+                        )
+                        img_label.setPixmap(scaled)
+                    else:
+                        img_label.setPixmap(pixmap)
+                    cap.setText(f"Page {idx + 1}")
+                    if update_status and not state.get("matches"):
+                        page_label.setText(f"Page {idx + 1} / {page_count}")
+                except Exception as exc:
+                    img_label.setText(f"Render error: {exc}")
+                    img_label.setStyleSheet(f"color:{TEMPLE_AMBER};")
+
+            def do_zoom(factor: float):
+                state["zoom"] = max(0.4, min(3.0, state["zoom"] * factor))
+                show_page(state["page"], update_status=False)
+            def find_text(direction: int = 0):
+                raw = search.text().strip()
+                q = raw
+                q_key = raw.casefold()
+                if not raw:
+                    state["matches"] = []
+                    state["match_idx"] = 0
+                    state["last_query"] = ""
+                    page_label.setText(f"Page {state['page'] + 1} / {page_count}")
+                    show_page(state["page"])
+                    return
+                need_scan = (
+                    direction == 0
+                    or state.get("last_query", "").casefold() != q_key
+                    or not state["matches"]
+                )
+                if need_scan:
+                    page_label.setText("Searching…")
+                    QApplication.processEvents()
+                    try:
+                        matches = lazy_doc.find_matching_pages(q)
+                    except Exception:
+                        matches = []
+                    state["matches"] = matches
+                    state["match_idx"] = 0
+                    state["last_query"] = raw
+                elif state["matches"]:
+                    state["match_idx"] = (
+                        state["match_idx"] + direction
+                    ) % len(state["matches"])
+                if not state["matches"]:
+                    page_label.setText("No matches")
+                    show_page(state["page"], update_status=False)
+                    return
+                idx = state["matches"][state["match_idx"]]
+                page_label.setText(
+                    f"Match {state['match_idx'] + 1} / {len(state['matches'])}  ·  page {idx + 1}"
+                )
+                show_page(idx, update_status=False)
+            def nav_prev():
+                if state["matches"] and state.get("last_query"):
+                    find_text(-1)
+                else:
+                    show_page(state["page"] - 1)
+            def nav_next():
+                if state["matches"] and state.get("last_query"):
+                    find_text(1)
+                else:
+                    show_page(state["page"] + 1)
+            prev_btn.clicked.connect(nav_prev)
+            next_btn.clicked.connect(nav_next)
+            zoom_in.clicked.connect(lambda: do_zoom(1.2))
+            zoom_out.clicked.connect(lambda: do_zoom(1 / 1.2))
+            find_btn.clicked.connect(lambda: find_text(0))
+            search.returnPressed.connect(lambda: find_text(0))
+            def on_query_edited(_text: str):
+                current = search.text().strip().casefold()
+                if state.get("last_query", "").casefold() != current:
+                    state["matches"] = []
+                    state["match_idx"] = 0
+            search.textChanged.connect(on_query_edited)
+            def key_nav(event):
+                if event.key() in (Qt.Key_Left, Qt.Key_PageUp):
+                    nav_prev()
+                elif event.key() in (Qt.Key_Right, Qt.Key_PageDown):
+                    nav_next()
+                elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    find_text(0)
+                else:
+                    QDialog.keyPressEvent(dialog, event)
+            dialog.keyPressEvent = key_nav
+            show_page(0)
+            def cleanup():
+                try:
+                    lazy_doc.close()
+                except Exception:
+                    pass
+                gc.collect()
+            dialog.finished.connect(lambda _: cleanup())
         def failure(msg):
             loading.setText(f"Could not display PDF:\n{msg}")
             loading.setStyleSheet(f"color:{TEMPLE_AMBER};")
-        t.succeeded.connect(success); t.failed.connect(failure)
-        t.finished.connect(lambda:t.deleteLater())
+        t.succeeded.connect(success)
+        t.failed.connect(failure)
+        t.finished.connect(lambda: t.deleteLater())
         t.start()
     def _preview_text(self,dialog,data):
         root=QVBoxLayout(dialog)
@@ -2742,37 +3102,73 @@ class VaultView(QWidget):
             play=QPushButton("⏸ Pause"); stop=QPushButton("⏹ Stop"); time_label=QLabel(f"0:00 / {self._fmt_time(info.duration)}")
             row.addWidget(play); row.addWidget(stop); row.addWidget(time_label)
             root.addLayout(row)
-            decode_size=_fit_decode_size(info.width,info.height,max(640,video_label.width()*2),max(360,video_label.height()*2))
-            state={"thread":None,"playing":True,"offset":0.0,"session":-1,"generation":0,"last_time":0.0}
-            wav_audio=None
+            widget_w = max(video_label.width() or 0, dialog.width() - 40)
+            widget_h = max(video_label.height() or 0, dialog.height() - 160)
+            target_w = max(960, widget_w)
+            target_h = max(540, widget_h)
+            decode_size = _fit_decode_size(
+                info.width, info.height, target_w, target_h, max_long_side=1920
+            )
+            state = {
+                "thread": None,
+                "playing": True,
+                "offset": 0.0,
+                "session": -1,
+                "generation": 0,
+                "last_time": 0.0,
+            }
+            wav_audio = None
             if info.has_audio:
-                try: wav_audio=extract_video_audio_as_wav(data)
-                except Exception: wav_audio=None
+                try:
+                    wav_audio = extract_video_audio_as_wav(data)
+                except Exception:
+                    wav_audio = None
             if wav_audio:
-                try: state["session"]=play_audio_in_memory(wav_audio); set_audio_volume(.8)
-                except Exception: state["session"]=-1
-            pump=QTimer(dialog)
-            def frame(t,w,h,rgb, th=None):
+                try:
+                    state["session"] = play_audio_in_memory(wav_audio)
+                    set_audio_volume(0.8)
+                except Exception:
+                    state["session"] = -1
+            pump = QTimer(dialog)
+            def frame(t, w, h, rgb, th=None):
                 if th is not None and state.get("thread") is not th:
                     return
-                img=QImage(rgb,w,h,w*3,QImage.Format_RGB888).copy()
-                pix=QPixmap.fromImage(img)
-                video_label.setPixmap(pix.scaled(video_label.size(),Qt.KeepAspectRatio,Qt.SmoothTransformation))
-                state["last_time"]=t
+                img = QImage(rgb, w, h, w * 3, QImage.Format_RGB888)
+                label_size = video_label.size()
+                if label_size.width() > 0 and (
+                    abs(label_size.width() - w) > 4 or abs(label_size.height() - h) > 4
+                ):
+                    pix = QPixmap.fromImage(img).scaled(
+                        label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                else:
+                    pix = QPixmap.fromImage(img)
+                video_label.setPixmap(pix)
+                if th is not None and hasattr(th, "notify_frame_consumed"):
+                    th.notify_frame_consumed()
+                state["last_time"] = t
                 if info.duration and not slider.isSliderDown():
-                    slider.setValue(min(1000,int(t/info.duration*1000)))
-                time_label.setText(f"{self._fmt_time(t)} / {self._fmt_time(info.duration)}")
+                    slider.setValue(min(1000, int(t / info.duration * 1000)))
+                time_label.setText(
+                    f"{self._fmt_time(t)} / {self._fmt_time(info.duration)}"
+                )
             def start_decode(at=0.0):
                 if state["thread"]:
                     try:
                         state["thread"].request_stop()
                         state["thread"].wait(800)
-                    except Exception: pass
-                state["generation"]+=1
-                th=VideoDecodeThread(data,info,at,decode_size,None)
-                th.frameReady.connect(lambda t,w,h,rgb, th=th: frame(t,w,h,rgb,th))
-                th.failed.connect(lambda msg: status.setText(f"Video decode error: {msg}"))
-                state["thread"]=th; th.start()
+                    except Exception:
+                        pass
+                state["generation"] += 1
+                th = VideoDecodeThread(data, info, at, decode_size, None)
+                th.frameReady.connect(
+                    lambda t, w, h, rgb, th=th: frame(t, w, h, rgb, th)
+                )
+                th.failed.connect(
+                    lambda msg: status.setText(f"Video decode error: {msg}")
+                )
+                state["thread"] = th
+                th.start()
             start_decode(0.0)
             def toggle():
                 state["playing"]=not state["playing"]
@@ -2864,26 +3260,39 @@ class VaultView(QWidget):
         t.start()
         t.finished.connect(lambda:t.deleteLater())
     def _close_vault(self):
-        for entry in self._open_entries: wipe_bytearray(entry.data)
-        self._open_entries=[]
+        for entry in self._open_entries:
+            wipe_bytearray(entry.data)
+        self._open_entries = []
         self._render_entries_list()
         self.entries_card.hide()
-        self._bca_path=None
+        self._bca_path = None
         self.open_dz_label.setText("📁  SELECT A .BCA ARCHIVE")
         self.open_dz_sub.setText("Will be opened only in memory: no data written to disk")
         self.open_status.setText("Vault closed · Data wiped from RAM.")
         self.open_status.setStyleSheet(f"color:{TEMPLE_GOLD_BRONZE};")
         self.open_pw_entry.clear()
+        gc.collect()
     def wipe_all_on_exit(self):
-        for entry in self._open_entries: wipe_bytearray(entry.data)
-        for entry in self._pending_create_entries: wipe_bytearray(entry.data)
-        self._open_entries=[]; self._pending_create_entries=[]
-        try: self.create_pw_entry.clear(); self.create_pw_confirm_entry.clear(); self.open_pw_entry.clear()
-        except Exception: pass
-        try: stop_audio()
-        except Exception: pass
-        for tmp in self._active_video_tmp_paths: _secure_shred_file(tmp)
+        for entry in self._open_entries:
+            wipe_bytearray(entry.data)
+        for entry in self._pending_create_entries:
+            wipe_bytearray(entry.data)
+        self._open_entries = []
+        self._pending_create_entries = []
+        try:
+            self.create_pw_entry.clear()
+            self.create_pw_confirm_entry.clear()
+            self.open_pw_entry.clear()
+        except Exception:
+            pass
+        try:
+            stop_audio()
+        except Exception:
+            pass
+        for tmp in self._active_video_tmp_paths:
+            _secure_shred_file(tmp)
         self._active_video_tmp_paths.clear()
+        gc.collect()
 class BastetCipherApp(QMainWindow):
     def __init__(self):
         super().__init__()
