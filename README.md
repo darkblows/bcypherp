@@ -1,4 +1,4 @@
-<img width="1445" height="922" alt="Schermata_20260825_154749" src="https://github.com/user-attachments/assets/1a211d1c-0e04-434d-9c4d-60c71ecf48e7" />
+<img width="1440" height="922" alt="Schermata_20260908_112125" src="https://github.com/user-attachments/assets/d8a01715-7973-4ed1-8876-d2353cd0cddf" />
 
 
 # BastetCipher — Desktop Edition
