@@ -890,16 +890,28 @@ class ViewerKind(Enum):
     AUDIO = auto()
     VIDEO = auto()
     UNSUPPORTED = auto()
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".svg", ".ico"}
+IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".svg", ".ico",
+    ".heic", ".heif", ".avif", ".psd", ".raw", ".cr2", ".nef",
+}
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".html", ".css",
     ".xml", ".yaml", ".yml", ".ini", ".cfg", ".sh", ".c", ".cpp", ".h",
     ".java", ".rs", ".go", ".rb", ".php", ".sql",
+    ".srt", ".vtt", ".ass", ".ssa",
 }
 PDF_EXTENSIONS = {".pdf"}
-AUDIO_EXTENSIONS = {".mp3", ".ogg", ".wav", ".flac", ".aac", ".m4a", ".wma"}
-AUDIO_TRANSCODE_EXTENSIONS = {".m4a", ".wma"}
-VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".avi", ".mkv", ".wmv"}
+AUDIO_EXTENSIONS = {
+    ".mp3", ".ogg", ".wav", ".flac", ".aac", ".m4a", ".wma",
+    ".opus", ".alac", ".m4b", ".mid", ".midi", ".ape",
+}
+AUDIO_TRANSCODE_EXTENSIONS = {
+    ".m4a", ".wma", ".opus", ".aac", ".alac", ".m4b", ".ape", ".mid", ".midi",
+}
+VIDEO_EXTENSIONS = {
+    ".mp4", ".webm", ".mov", ".avi", ".mkv", ".wmv",
+    ".3gp", ".flv", ".ts", ".m2ts", ".vob", ".divx",
+}
 def classify_extension(filename: str) -> ViewerKind:
     ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext in IMAGE_EXTENSIONS:
