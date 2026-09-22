@@ -560,7 +560,14 @@ def derive_vault_keys(
             iterations=iterations,
             backend=default_backend(),
         )
-        derived = kdf.derive(bytes(password))
+        # PBKDF2HMAC.derive() accepts any buffer-protocol object, so the
+        # bytearray password can be passed directly rather than copied into
+        # an immutable bytes object first -- bytes can't later be wiped,
+        # so avoiding the copy here is a real (if small) reduction in how
+        # long the plaintext password can linger in memory. The Argon2id
+        # branch above still copies to bytes because argon2-cffi's API
+        # documents `secret` as required to be bytes specifically.
+        derived = kdf.derive(password)
     k1 = bytearray(derived[0:32])
     k2 = bytearray(derived[32:64])
     if isinstance(derived, (bytes, bytearray)):
@@ -944,21 +951,45 @@ def _sniff_media_kind(data: bytes, claimed: ViewerKind) -> None:
             pass  # ffmpeg probe is the real gate
 
 
-def _apply_child_resource_limits() -> None:
-    """Tighten RLIMIT for worker processes that parse untrusted media."""
+def _apply_child_resource_limits(input_size_bytes: int = 0) -> None:
+    """Tighten RLIMIT for worker processes that parse untrusted media.
+
+    The address-space cap is scaled to the input rather than a flat
+    constant: video is decoded by ffmpeg at its *source* resolution before
+    any of our own output-side downscaling is applied (the scale filter
+    runs after decode), so a legitimate large/high-resolution file can
+    need well over a gigabyte of decoder working set even though what we
+    stream back out is small. A flat ~2 GiB cap risks rejecting real,
+    non-malicious files. Scaling to the input size keeps the cap no
+    smaller than what legitimate content of that size plausibly needs,
+    while still bounding a pathological stream that is small on disk but
+    designed to explode in memory on decode.
+    """
     if _SYSTEM not in ("Linux", "Darwin"):
         return
     try:
         import resource
-        # Cap address space (~2 GiB) and CPU time for the child.
         soft_as, hard_as = resource.getrlimit(resource.RLIMIT_AS)
-        cap_as = min(hard_as if hard_as > 0 else 2 * 1024 ** 3, 2 * 1024 ** 3)
+        # Generous multiplier + floor to comfortably cover decoder
+        # reference-frame buffers, filter graphs, and process overhead for
+        # legitimate high-resolution source video, while a hard ceiling
+        # still bounds worst-case memory use from adversarial input.
+        floor_bytes = 2 * 1024 ** 3        # 2 GiB minimum, matches prior behavior for small/unknown inputs
+        ceiling_bytes = 12 * 1024 ** 3     # 12 GiB hard ceiling regardless of input size
+        scaled = max(floor_bytes, input_size_bytes * 12) if input_size_bytes > 0 else floor_bytes
+        cap_as = min(scaled, ceiling_bytes)
+        if hard_as > 0:
+            cap_as = min(cap_as, hard_as)
         resource.setrlimit(resource.RLIMIT_AS, (cap_as, hard_as if hard_as > 0 else cap_as))
         resource.setrlimit(resource.RLIMIT_CPU, (MEDIA_PARSE_TIMEOUT_SEC + 30, MEDIA_PARSE_TIMEOUT_SEC + 60))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        # No new files preferred; best-effort.
+        # No new files preferred; best-effort. ffmpeg legitimately opens
+        # several fds (pipes, codec/format library internals, sometimes
+        # dynamically loaded libraries), so this is a loose ceiling, not a
+        # tight one -- it exists to stop fd-exhaustion abuse, not to
+        # constrain normal operation.
         try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
         except Exception:
             pass
     except Exception:
@@ -1296,7 +1327,7 @@ def probe_video_in_memory(data: bytes) -> VideoInfo:
             stderr=subprocess.PIPE,
         )
         if _SYSTEM in ("Linux", "Darwin"):
-            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+            popen_kwargs["preexec_fn"] = lambda: _apply_child_resource_limits(len(data))
         proc = subprocess.Popen(
             [ffmpeg, "-hide_banner", "-i", video_path],
             **popen_kwargs,
@@ -1410,7 +1441,7 @@ def stream_video_frames_in_memory(
             bufsize=frame_size,  # ~1 frame
         )
         if _SYSTEM in ("Linux", "Darwin"):
-            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+            popen_kwargs["preexec_fn"] = lambda: _apply_child_resource_limits(len(data))
         proc = subprocess.Popen(cmd, **popen_kwargs)
         if process_holder is not None:
             process_holder.append(proc)
@@ -1445,7 +1476,7 @@ def extract_video_audio_as_wav(data: bytes) -> Optional[bytes]:
         ]
         popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if _SYSTEM in ("Linux", "Darwin"):
-            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+            popen_kwargs["preexec_fn"] = lambda: _apply_child_resource_limits(len(data))
         proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
             stdout, _ = proc.communicate(timeout=MEDIA_PARSE_TIMEOUT_SEC)
@@ -1476,7 +1507,7 @@ def transcode_audio_to_wav_in_memory(data: bytes) -> bytes:
         ]
         popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if _SYSTEM in ("Linux", "Darwin"):
-            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+            popen_kwargs["preexec_fn"] = lambda: _apply_child_resource_limits(len(data))
         proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
             stdout, stderr = proc.communicate(timeout=MEDIA_PARSE_TIMEOUT_SEC)
@@ -1506,7 +1537,7 @@ def get_audio_duration_seconds(data: bytes, filename: Optional[str] = None) -> O
             with _video_input_source(data) as src_path:
                 popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 if _SYSTEM in ("Linux", "Darwin"):
-                    popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+                    popen_kwargs["preexec_fn"] = lambda: _apply_child_resource_limits(len(data))
                 proc = subprocess.Popen(
                     [ffmpeg, "-hide_banner", "-i", src_path],
                     **popen_kwargs,
