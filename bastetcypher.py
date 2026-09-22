@@ -183,21 +183,16 @@ def _harden_linux_process() -> None:
     except Exception:
         pass
 def _try_mlockall() -> bool:
-    """Lock all current and future process pages into RAM to reduce swap risk.
-    Best-effort: requires CAP_IPC_LOCK or sufficient RLIMIT_MEMLOCK on Linux.
-    On failure the app continues with per-buffer mlock (SecureBuffer)."""
     if _SYSTEM not in ("Linux", "Darwin"):
         return False
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c") or ("libc.so.6" if _SYSTEM == "Linux" else "libc.dylib"), use_errno=True)
-        # MCL_CURRENT | MCL_FUTURE
         MCL_CURRENT = 1
         MCL_FUTURE = 2
         ret = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
         return ret == 0
     except Exception:
         return False
-
 
 def harden_process() -> None:
     disable_core_dumps()
@@ -350,6 +345,25 @@ def pbkdf2_hex(password: str, salt_str: str, iterations: int, key_length: int) -
         dklen=key_length,
     )
     return derived.hex()
+
+
+def argon2id_hex(password: str, salt_str: str, key_length: int = 64) -> str:
+    if not _HAS_ARGON2:
+        raise RuntimeError(
+            "Argon2id requires the 'argon2-cffi' package. Install with:\n"
+            "    pip install argon2-cffi"
+        )
+    salt_bytes = hashlib.sha256(salt_str.encode("utf-8")).digest()
+    derived = hash_secret_raw(
+        secret=password.encode("utf-8"),
+        salt=salt_bytes,
+        time_cost=ARGON2_TIME,
+        memory_cost=ARGON2_MEMORY_KIB,
+        parallelism=ARGON2_PARALLELISM,
+        hash_len=key_length,
+        type=Argon2Type.ID,
+    )
+    return derived.hex()
 def _lcg_next(state: int) -> int:
     return (state * 1664525 + 1013904223) & MASK32
 def _js_parse_int_decimal(digits: str) -> int:
@@ -443,11 +457,15 @@ class CipherResult:
     iterations: int
     salt_hex: str
     amplifier: int
+    kdf_name: str = "PBKDF2-HMAC-SHA512"
+
+
 def run_cipher_pipeline(
     input_str: str,
     pim: str,
     amplifier: int,
     on_progress: Optional[ProgressCallback] = None,
+    kdf_id: int = 0,
 ) -> CipherResult:
     progress = on_progress or _noop_progress
     progress(10, "Invoking the Sacred Salt...")
@@ -470,9 +488,24 @@ def run_cipher_pipeline(
     base_iter = 50000 + int((hash_int / 16777215) * 550000)
     twist = (pim_num % 65537) * 7
     iters = base_iter + twist
-    progress(60, f"PBKDF2 · {iters:,} iterations...")
-    pbkdf2_salt = sha256_hex("BastetCipher" + input_str + pim + PEPPER)
-    derived_key = pbkdf2_hex(combined + PEPPER, pbkdf2_salt, iters, 64)
+    kdf_salt = sha256_hex("BastetCipher" + input_str + pim + PEPPER)
+    if kdf_id == KDF_ARGON2ID:
+        if not _HAS_ARGON2:
+            raise RuntimeError(
+                "Argon2id requires the 'argon2-cffi' package. Install with:\n"
+                "    pip install argon2-cffi"
+            )
+        progress(
+            60,
+            f"Argon2id · m={ARGON2_MEMORY_KIB // 1024}MiB t={ARGON2_TIME} p={ARGON2_PARALLELISM}...",
+        )
+        derived_key = argon2id_hex(combined + PEPPER, kdf_salt, 64)
+        kdf_name = "Argon2id"
+        iters = ARGON2_TIME * ARGON2_MEMORY_KIB
+    else:
+        progress(60, f"PBKDF2 · {iters:,} iterations...")
+        derived_key = pbkdf2_hex(combined + PEPPER, kdf_salt, iters, 64)
+        kdf_name = "PBKDF2-HMAC-SHA512"
     progress(85, "Key derived. Inserting sacred glyphs...")
     with_special = insert_special_chars(derived_key, seed)
     with_case = apply_mixed_case(with_special, seed)
@@ -490,21 +523,25 @@ def run_cipher_pipeline(
         iterations=iters,
         salt_hex=salt,
         amplifier=amplifier,
+        kdf_name=kdf_name,
     )
 BCA_MAGIC = bytes([0x42, 0x43, 0x41, 0x01])
 BCA_VERSION = 1
-BCA_VERSION_V2 = 2  # adds KDF selector (PBKDF2 or Argon2id)
-BCA_ITERS = 200_000
-# Argon2id parameters (memory cost in KiB, time cost, parallelism, hash len)
-# Tuned for interactive desktop use while remaining memory-hard.
+BCA_VERSION_V2 = 2
+BCA_ITERS = 310_000
+BCA_ITERS_LEGACY = 200_000
+BCA_ITERS_MIN = 100_000
+BCA_ITERS_MAX = 5_000_000
 ARGON2_MEMORY_KIB = 64 * 1024  # 64 MiB
 ARGON2_TIME = 3
 ARGON2_PARALLELISM = 4
 ARGON2_HASH_LEN = 64
 KDF_PBKDF2 = 0
 KDF_ARGON2ID = 1
-HEADER_LEN = 69  # v1
-HEADER_LEN_V2 = 70  # v2: +1 byte kdf_id after version
+VAULT_PASSWORD_MIN_LEN = 12
+HEADER_LEN = 69
+HEADER_LEN_V2 = 70
+_BCA_AUTH_FAIL = "Wrong password or corrupted/tampered archive."
 class BCAFormatError(ValueError):
     pass
 class BCADecryptError(ValueError):
@@ -560,13 +597,6 @@ def derive_vault_keys(
             iterations=iterations,
             backend=default_backend(),
         )
-        # PBKDF2HMAC.derive() accepts any buffer-protocol object, so the
-        # bytearray password can be passed directly rather than copied into
-        # an immutable bytes object first -- bytes can't later be wiped,
-        # so avoiding the copy here is a real (if small) reduction in how
-        # long the plaintext password can linger in memory. The Argon2id
-        # branch above still copies to bytes because argon2-cffi's API
-        # documents `secret` as required to be bytes specifically.
         derived = kdf.derive(password)
     k1 = bytearray(derived[0:32])
     k2 = bytearray(derived[32:64])
@@ -593,11 +623,17 @@ def build_bca(
     kdf_id: int = KDF_PBKDF2,
 ) -> bytearray:
     progress = on_progress or _noop_progress
+    if not password or len(password) < VAULT_PASSWORD_MIN_LEN:
+        raise BCAFormatError(
+            f"Archive password must be at least {VAULT_PASSWORD_MIN_LEN} characters."
+        )
     if kdf_id == KDF_ARGON2ID and not _HAS_ARGON2:
         raise BCAFormatError(
             "Argon2id selected but 'argon2-cffi' is not installed. "
             "Install with: pip install argon2-cffi"
         )
+    if kdf_id not in (KDF_PBKDF2, KDF_ARGON2ID):
+        raise BCAFormatError("Unsupported KDF identifier.")
     salt = os.urandom(32)
     iv1 = os.urandom(12)
     iv2 = os.urandom(16)
@@ -638,12 +674,11 @@ def build_bca(
         ct1 = None
         progress(92, "Finalizing and wiping RAM residuals...")
         if kdf_id == KDF_ARGON2ID:
-            # v2 header: magic + version + kdf_id + salt + iters(placeholder) + iv1 + iv2
             header = (
                 BCA_MAGIC
                 + bytes([BCA_VERSION_V2, kdf_id])
                 + salt
-                + struct.pack("<I", 0)  # unused for Argon2; params are fixed in code
+                + struct.pack("<I", 0)
                 + iv1
                 + iv2
             )
@@ -692,15 +727,17 @@ def _aes_cbc_encrypt(key: bytes, iv: bytes, data: "bytes | bytearray | memoryvie
     return result
 def _aes_cbc_decrypt(key: bytes, iv: bytes, data: "bytes | bytearray | memoryview") -> bytes:
     if len(data) % 16 != 0:
-        raise BCADecryptError("Invalid ciphertext length.")
+        raise BCADecryptError(_BCA_AUTH_FAIL)
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     decryptor = cipher.decryptor()
     padded = decryptor.update(data) + decryptor.finalize()
     if not padded:
-        raise BCADecryptError("Void Payload.")
+        raise BCADecryptError(_BCA_AUTH_FAIL)
     pad_len = padded[-1]
     if pad_len < 1 or pad_len > 16 or len(padded) < pad_len:
-        raise BCADecryptError("Invalid padding (wrong password or corrupted file).")
+        raise BCADecryptError(_BCA_AUTH_FAIL)
+    if padded[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise BCADecryptError(_BCA_AUTH_FAIL)
     return padded[:-pad_len]
 def parse_bca(
     buffer: bytearray,
@@ -715,11 +752,10 @@ def parse_bca(
         raise BCAFormatError("Unrecognized file (magic bytes mismatch).")
     version = d[4]
     if version == BCA_VERSION:
-        # v1: magic(4) + ver(1) + salt(32) + iters(4) + iv1(12) + iv2(16) = 69
         kdf_id = KDF_PBKDF2
         salt = bytes(d[5:37])
         iterations = struct.unpack("<I", d[37:41])[0]
-        if iterations != BCA_ITERS:
+        if not (BCA_ITERS_MIN <= iterations <= BCA_ITERS_MAX):
             raise BCAFormatError("Invalid PBKDF2 parameter for this archive.")
         iv1 = bytes(d[41:53])
         iv2 = bytes(d[53:69])
@@ -727,13 +763,12 @@ def parse_bca(
     elif version == BCA_VERSION_V2:
         if len(d) < HEADER_LEN_V2:
             raise BCAFormatError("File too short for a v2 .bca archive.")
-        # v2: magic(4) + ver(1) + kdf_id(1) + salt(32) + iters(4) + iv1(12) + iv2(16) = 70
         kdf_id = d[5]
         if kdf_id not in (KDF_PBKDF2, KDF_ARGON2ID):
             raise BCAFormatError("Unsupported KDF identifier in archive.")
         salt = bytes(d[6:38])
         iterations = struct.unpack("<I", d[38:42])[0]
-        if kdf_id == KDF_PBKDF2 and iterations != BCA_ITERS:
+        if kdf_id == KDF_PBKDF2 and not (BCA_ITERS_MIN <= iterations <= BCA_ITERS_MAX):
             raise BCAFormatError("Invalid PBKDF2 parameter for this archive.")
         iv1 = bytes(d[42:54])
         iv2 = bytes(d[54:70])
@@ -742,7 +777,12 @@ def parse_bca(
         raise BCAFormatError("Archive version not supported.")
     ct_view = memoryview(d)[ct_offset:]
     progress(10, "Re-deriving 512-bit keys...")
-    k1, k2 = derive_vault_keys(password, salt, iterations if kdf_id == KDF_PBKDF2 else BCA_ITERS, kdf_id=kdf_id)
+    k1, k2 = derive_vault_keys(
+        password,
+        salt,
+        iterations if kdf_id == KDF_PBKDF2 else BCA_ITERS,
+        kdf_id=kdf_id,
+    )
     plain: Optional[bytearray] = None
     ct1: Optional[bytes] = None
     try:
@@ -753,18 +793,16 @@ def parse_bca(
             raise
         except MemoryError:
             raise
-        except Exception as exc:
-            raise BCADecryptError(f"Layer 2 error: {exc}") from exc
+        except Exception:
+            raise BCADecryptError(_BCA_AUTH_FAIL) from None
         progress(45, "Layer 1 decryption...")
         try:
             aesgcm = AESGCM(bytes(k1))
             plain = bytearray(aesgcm.decrypt(iv1, ct1, None))
         except MemoryError:
             raise
-        except Exception as exc:
-            raise BCADecryptError(
-                "Layer 1 error: wrong password or tampered file (authenticity check failed)."
-            ) from exc
+        except Exception:
+            raise BCADecryptError(_BCA_AUTH_FAIL) from None
         del ct1
         ct1 = None
         progress(54, "Analyzing structure...")
@@ -881,44 +919,30 @@ class RenderedPage:
 def _looks_like_svg(data: bytes) -> bool:
     head = data[:512].lstrip(b"\xef\xbb\xbf \t\r\n")
     return head.startswith(b"<?xml") or head.startswith(b"<svg") or b"<svg" in head[:200]
-
-
-# ---------------------------------------------------------------------------
-# Multi-layer media safety guards
-# These reduce (they cannot eliminate) the risk of malicious PDFs, images,
-# audio and video. Full OS-level sandboxing is still recommended for a
-# high-assurance threat model.
-# ---------------------------------------------------------------------------
-
-# Soft ceilings kept high so legitimate large media still previews; hard
-# decompression / dimension caps below still block classic bomb payloads.
-MAX_IMAGE_PIXELS = 80_000_000          # ~80 MP after decode
-MAX_IMAGE_DIMENSION = 16_384           # per side
-MAX_PDF_PAGES_SOFT = 5_000             # refuse absurd page counts
+MAX_IMAGE_PIXELS = 80_000_000
+MAX_IMAGE_DIMENSION = 16_384
+MAX_PDF_PAGES_SOFT = 5_000
 MAX_PDF_RENDER_DPI = 150
 MEDIA_PARSE_TIMEOUT_SEC = 90
 
-
 def _sniff_media_kind(data: bytes, claimed: ViewerKind) -> None:
-    """Reject obvious magic mismatches before handing bytes to a parser."""
     if not data:
         raise ValueError("Empty media payload.")
     head = data[:16]
     if claimed == ViewerKind.PDF:
-        # PDF may start with whitespace then %PDF
         probe = data[:1024].lstrip()
         if not probe.startswith(b"%PDF"):
             raise ValueError("Content does not look like a PDF (missing %PDF header).")
     elif claimed == ViewerKind.IMAGE:
         ok = (
             head.startswith(b"\x89PNG")
-            or head.startswith(b"\xff\xd8\xff")  # JPEG
+            or head.startswith(b"\xff\xd8\xff")
             or head.startswith(b"GIF87a")
             or head.startswith(b"GIF89a")
             or head.startswith(b"BM")
             or head.startswith(b"RIFF") and data[8:12] == b"WEBP"
-            or head[:4] in (b"II*\x00", b"MM\x00*")  # TIFF
-            or head.startswith(b"\x00\x00\x01\x00")  # ICO
+            or head[:4] in (b"II*\x00", b"MM\x00*")
+            or head.startswith(b"\x00\x00\x01\x00")
             or _looks_like_svg(data)
         )
         if not ok:
@@ -932,50 +956,32 @@ def _sniff_media_kind(data: bytes, claimed: ViewerKind) -> None:
             or head.startswith(b"OggS")
             or head.startswith(b"fLaC")
             or head.startswith(b"RIFF")
-            or head[4:8] == b"ftyp"  # m4a/mp4 family
-            or head.startswith(b"\x30\x26\xb2\x75")  # ASF/WMA
+            or head[4:8] == b"ftyp"
+            or head.startswith(b"\x30\x26\xb2\x75")
         )
         if not ok:
-            # Soft warning path: still allow unknown audio; ffmpeg may handle it.
             pass
     elif claimed == ViewerKind.VIDEO:
         ok = (
             head[4:8] == b"ftyp"
-            or head.startswith(b"\x1a\x45\xdf\xa3")  # EBML/WebM/MKV
+            or head.startswith(b"\x1a\x45\xdf\xa3")
             or head.startswith(b"RIFF")
             or head.startswith(b"\x00\x00\x00\x14ftyp")
-            or head.startswith(b"\x00\x00\x01\xba")  # MPEG-PS
+            or head.startswith(b"\x00\x00\x01\xba")
             or head.startswith(b"\x00\x00\x01\xb3")
         )
         if not ok:
-            pass  # ffmpeg probe is the real gate
+            pass
 
 
 def _apply_child_resource_limits(input_size_bytes: int = 0) -> None:
-    """Tighten RLIMIT for worker processes that parse untrusted media.
-
-    The address-space cap is scaled to the input rather than a flat
-    constant: video is decoded by ffmpeg at its *source* resolution before
-    any of our own output-side downscaling is applied (the scale filter
-    runs after decode), so a legitimate large/high-resolution file can
-    need well over a gigabyte of decoder working set even though what we
-    stream back out is small. A flat ~2 GiB cap risks rejecting real,
-    non-malicious files. Scaling to the input size keeps the cap no
-    smaller than what legitimate content of that size plausibly needs,
-    while still bounding a pathological stream that is small on disk but
-    designed to explode in memory on decode.
-    """
     if _SYSTEM not in ("Linux", "Darwin"):
         return
     try:
         import resource
         soft_as, hard_as = resource.getrlimit(resource.RLIMIT_AS)
-        # Generous multiplier + floor to comfortably cover decoder
-        # reference-frame buffers, filter graphs, and process overhead for
-        # legitimate high-resolution source video, while a hard ceiling
-        # still bounds worst-case memory use from adversarial input.
-        floor_bytes = 2 * 1024 ** 3        # 2 GiB minimum, matches prior behavior for small/unknown inputs
-        ceiling_bytes = 12 * 1024 ** 3     # 12 GiB hard ceiling regardless of input size
+        floor_bytes = 2 * 1024 ** 3
+        ceiling_bytes = 12 * 1024 ** 3
         scaled = max(floor_bytes, input_size_bytes * 12) if input_size_bytes > 0 else floor_bytes
         cap_as = min(scaled, ceiling_bytes)
         if hard_as > 0:
@@ -983,11 +989,6 @@ def _apply_child_resource_limits(input_size_bytes: int = 0) -> None:
         resource.setrlimit(resource.RLIMIT_AS, (cap_as, hard_as if hard_as > 0 else cap_as))
         resource.setrlimit(resource.RLIMIT_CPU, (MEDIA_PARSE_TIMEOUT_SEC + 30, MEDIA_PARSE_TIMEOUT_SEC + 60))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        # No new files preferred; best-effort. ffmpeg legitimately opens
-        # several fds (pipes, codec/format library internals, sometimes
-        # dynamically loaded libraries), so this is a loose ceiling, not a
-        # tight one -- it exists to stop fd-exhaustion abuse, not to
-        # constrain normal operation.
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
         except Exception:
@@ -997,17 +998,10 @@ def _apply_child_resource_limits(input_size_bytes: int = 0) -> None:
 
 
 def _open_pdf_restricted(data: bytes):
-    """Open a PDF with the most defensive fitz options available."""
     import fitz
-    # Prefer stream open; never write to disk from this path.
     doc = fitz.open(stream=data, filetype="pdf")
     try:
-        # Disable dangerous PDF features where the API allows it.
-        # MuPDF/PyMuPDF does not execute JS by default in recent versions;
-        # still force repair/clean on open when supported.
         if hasattr(doc, "is_encrypted") and doc.is_encrypted:
-            # Passworded PDFs inside the vault are unexpected; refuse rather
-            # than prompt (avoids interaction traps).
             doc.close()
             raise ValueError("Encrypted PDF streams are not opened in preview.")
         if doc.page_count > MAX_PDF_PAGES_SOFT:
@@ -1016,9 +1010,8 @@ def _open_pdf_restricted(data: bytes):
                 f"PDF has {doc.page_count} pages (limit {MAX_PDF_PAGES_SOFT}). "
                 "Export and open externally if this is intentional."
             )
-        # Optional: set a low memory / no-cache preference if available.
         try:
-            fitz.TOOLS.store_shrink(100)  # drop MuPDF store aggressively
+            fitz.TOOLS.store_shrink(100)
         except Exception:
             pass
     except Exception:
@@ -1033,15 +1026,12 @@ def _open_pdf_restricted(data: bytes):
 def render_image_in_memory(data: bytes) -> Image.Image:
     _sniff_media_kind(data, ViewerKind.IMAGE)
     if _looks_like_svg(data):
-        # SVG → raster via MuPDF in a constrained path (no external entity expansion
-        # beyond what MuPDF itself allows; size already capped by caller).
         import fitz
         doc = fitz.open(stream=data, filetype="svg")
         try:
             if doc.page_count < 1:
                 raise ValueError("Empty SVG document.")
             page = doc.load_page(0)
-            # Cap raster size to avoid SVG bombs expanding into huge bitmaps.
             rect = page.rect
             max_side = 4096
             scale = 1.0
@@ -1052,14 +1042,12 @@ def render_image_in_memory(data: bytes) -> Image.Image:
             data = pix.tobytes("png")
         finally:
             doc.close()
-    # Pillow: deny decompression bombs before full load.
     try:
         Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
     except Exception:
         pass
     buf = io.BytesIO(data)
     img = Image.open(buf)
-    # Verify header dimensions before decoding full pixel buffer when possible.
     w, h = img.size
     if w > MAX_IMAGE_DIMENSION or h > MAX_IMAGE_DIMENSION:
         img.close()
@@ -1073,7 +1061,6 @@ def render_image_in_memory(data: bytes) -> Image.Image:
             f"Image pixel count {w * h:,} exceeds the safe limit "
             f"({MAX_IMAGE_PIXELS:,})."
         )
-    # Load pixels (this is the costly / risky step); already dimension-checked.
     img.load()
     return img
 
@@ -1093,7 +1080,6 @@ def render_pdf_pages_in_memory(
         for i in range(count):
             page = doc.load_page(i)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
-            # Guard against a single page expanding into an absurd bitmap.
             if pix.width * pix.height > MAX_IMAGE_PIXELS:
                 raise ValueError(
                     f"PDF page {i + 1} rasterizes to {pix.width}x{pix.height}, "
@@ -1125,7 +1111,7 @@ class LazyPDFDocument:
         self._matrix = fitz.Matrix(self._zoom, self._zoom)
         self._cache: dict[Tuple[int, str], Tuple[QPixmap, int, int]] = {}
         self._cache_order: List[Tuple[int, str]] = []
-        self._max_cache = 2  # keep memory footprint low; pages are re-rendered on demand
+        self._max_cache = 2
         self._text_cache: dict[int, str] = {}
     @property
     def page_count(self) -> int:
@@ -1286,10 +1272,8 @@ def _ffmpeg_platform_tag() -> str:
     return "linux-x86_64"
 @contextlib.contextmanager
 def _video_input_source(data: bytes):
-    """Write media to a RAM-backed temp file when possible, with restrictive mode."""
     import tempfile
     ram_disk = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
-    # Prefer exclusive create + owner-only permissions.
     fd, tmp_path = tempfile.mkstemp(suffix=".vidsrc", dir=ram_disk)
     try:
         try:
@@ -1496,8 +1480,6 @@ def _needs_audio_transcode(filename: Optional[str], data: bytes) -> bool:
             return True
     return False
 def transcode_audio_to_wav_in_memory(data: bytes) -> bytes:
-    """Transcode formats SDL_mixer can't read directly (m4a, wma) to WAV,
-    entirely via ffmpeg pipes/RAM-backed temp storage. Raises on failure."""
     ffmpeg = _get_ffmpeg_exe()
     with _video_input_source(data) as src_path:
         cmd = [
@@ -1573,12 +1555,6 @@ def play_audio_in_memory(data: bytes, start_seconds: float = 0.0, filename: Opti
     if _needs_audio_transcode(filename, data):
         data = transcode_audio_to_wav_in_memory(data)
     pygame.mixer.music.load(_io.BytesIO(data))
-    # pygame.mixer.music.get_pos()/play(start=...) behave inconsistently
-    # across formats (WAV in particular isn't in the set of formats with
-    # documented seek/position support), which after enough pause/resume
-    # or seek cycles lets the tracked position drift from what's actually
-    # audible -- most visible on long tracks. Track position ourselves
-    # with a wall clock instead of trusting the mixer's own counter.
     seeked = False
     if start_seconds > 0:
         try:
@@ -1616,11 +1592,6 @@ def unpause_audio() -> None:
     import pygame
     if pygame.mixer.get_init():
         if _AUDIO_CLOCK_PAUSED_AT is not None:
-            # Fold the elapsed-before-pause time into the offset and reset
-            # the clock's start point to now, so time spent paused is never
-            # counted as playback (this is exactly the class of drift that
-            # pygame's own get_pos() is documented to get wrong across a
-            # pause/unpause cycle).
             _AUDIO_CLOCK_OFFSET += _AUDIO_CLOCK_PAUSED_AT - _AUDIO_CLOCK_START
             _AUDIO_CLOCK_START = time.monotonic()
             _AUDIO_CLOCK_PAUSED_AT = None
@@ -2618,15 +2589,31 @@ class GeneratorView(QWidget):
         self.amp_entry.setFont(_font(14, "Consolas"))
         self.amp_entry.textChanged.connect(self._sanitize_amp)
         grid.addWidget(self.amp_entry, 5, 1)
+        grid.addWidget(self._label("Key derivation"), 6, 0, 1, 2)
+        self.gen_kdf_combo = QComboBox()
+        self.gen_kdf_combo.addItem("PBKDF2-HMAC-SHA512 (variable iters) — classic", KDF_PBKDF2)
+        if _HAS_ARGON2:
+            self.gen_kdf_combo.addItem(
+                f"Argon2id (m={ARGON2_MEMORY_KIB // 1024}MiB, t={ARGON2_TIME}, p={ARGON2_PARALLELISM}) — memory-hard",
+                KDF_ARGON2ID,
+            )
+            self.gen_kdf_combo.setCurrentIndex(1)
+        else:
+            self.gen_kdf_combo.addItem(
+                "Argon2id (install argon2-cffi to enable)",
+                KDF_ARGON2ID,
+            )
+            self.gen_kdf_combo.setCurrentIndex(0)
+        grid.addWidget(self.gen_kdf_combo, 7, 0, 1, 2)
         self.error_label = QLabel()
         self.error_label.setWordWrap(True)
         self.error_label.setStyleSheet(f"color:{TEMPLE_AMBER};")
-        grid.addWidget(self.error_label, 6, 0, 1, 2)
+        grid.addWidget(self.error_label, 8, 0, 1, 2)
         self.generate_btn = QPushButton("𓅓  INITIALIZE SEQUENCE  𓅓")
         self.generate_btn.setObjectName("primaryButton")
         self.generate_btn.setFont(_font(16, "Georgia", True))
         self.generate_btn.clicked.connect(self._on_generate)
-        grid.addWidget(self.generate_btn, 7, 0, 1, 2)
+        grid.addWidget(self.generate_btn, 9, 0, 1, 2)
         status_row = QHBoxLayout()
         self.generate_spinner = SacredSpinner()
         self.status_label = QLabel()
@@ -2634,12 +2621,12 @@ class GeneratorView(QWidget):
         self.status_label.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
         status_row.addWidget(self.generate_spinner)
         status_row.addWidget(self.status_label, 1)
-        grid.addLayout(status_row, 8, 0, 1, 2)
+        grid.addLayout(status_row, 10, 0, 1, 2)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.hide()
-        grid.addWidget(self.progress, 9, 0, 1, 2)
+        grid.addWidget(self.progress, 11, 0, 1, 2)
         outer.addWidget(card)
         self.output_card = GlowFrame(accent=TEMPLE_GOLD_SUN, radius=22)
         out = QVBoxLayout(self.output_card)
@@ -2708,7 +2695,7 @@ class GeneratorView(QWidget):
             self.toggle_btn.setText("⊘")
             self.toggle_btn.setStyleSheet("")
     def _set_busy(self, busy: bool, label: str = ""):
-        for w in (self.phrase_entry, self.pim_entry, self.amp_entry):
+        for w in (self.phrase_entry, self.pim_entry, self.amp_entry, self.gen_kdf_combo):
             w.setEnabled(not busy)
         self.generate_btn.setEnabled(not busy)
         if busy:
@@ -2731,15 +2718,24 @@ class GeneratorView(QWidget):
         if not phrase or not pim or not PIM_RE.match(pim):
             self.error_label.setText("⚠ Enter a valid phrase and a PIM of 1-32 digits.")
             return
+        if len(phrase) < 8:
+            self.error_label.setText("⚠ Secret phrase should be at least 8 characters for meaningful entropy.")
+            return
         try:
             amp = max(0, min(9999, int(amp_raw)))
         except ValueError:
             amp = 0
+        kdf_id = self.gen_kdf_combo.currentData()
+        if kdf_id is None:
+            kdf_id = KDF_PBKDF2
+        if kdf_id == KDF_ARGON2ID and not _HAS_ARGON2:
+            self.error_label.setText("⚠ Argon2id needs argon2-cffi (pip install argon2-cffi).")
+            return
         self.error_label.clear()
         self.output_card.hide()
         self._set_busy(True, "Generating...")
         def worker(progress_emit):
-            return run_cipher_pipeline(phrase, pim, amp, progress_emit)
+            return run_cipher_pipeline(phrase, pim, amp, progress_emit, kdf_id=kdf_id)
         thread = TaskThread(worker, self)
         self._thread = thread
         thread.progress.connect(self._update_progress)
@@ -2763,9 +2759,14 @@ class GeneratorView(QWidget):
     def _on_success(self, result):
         self._last_cipher = result.final_cipher
         self.output_box.setPlainText(result.final_cipher)
+        kdf_label = getattr(result, "kdf_name", "PBKDF2-HMAC-SHA512")
+        if kdf_label.startswith("Argon2"):
+            cost_txt = f"{kdf_label} (memory-hard)"
+        else:
+            cost_txt = f"{kdf_label}: {result.iterations:,} iterations"
         self.stats_label.setText(
             f"Length: {len(result.final_cipher)} characters   ·   "
-            f"PBKDF2 iterations: {result.iterations:,}   ·   "
+            f"{cost_txt}   ·   "
             f"Amplifier: {'+' + str(result.amplifier) if result.amplifier else 'disabled'}   ·   "
             f"Salt: {result.salt_hex[:12]}…"
         )
@@ -2806,6 +2807,9 @@ class VaultView(QWidget):
         self._active_video_tmp_paths: list[str] = []
         self._threads: list[QThread] = []
         self._bca_path = None
+        self._open_password: Optional[bytearray] = None
+        self._open_kdf_id: int = KDF_PBKDF2
+        self._vault_dirty: bool = False
         self.create_pw_entry = None
         self.create_pw_confirm_entry = None
         self.open_pw_entry = None
@@ -2877,19 +2881,22 @@ class VaultView(QWidget):
         kdf_label.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
         auth.addWidget(kdf_label, 3, 0)
         self.create_kdf_combo = QComboBox()
-        self.create_kdf_combo.addItem("PBKDF2-HMAC-SHA512 (200k iters) — classic", KDF_PBKDF2)
+        self.create_kdf_combo.addItem(
+            f"PBKDF2-HMAC-SHA512 ({BCA_ITERS // 1000}k iters) — classic",
+            KDF_PBKDF2,
+        )
         if _HAS_ARGON2:
             self.create_kdf_combo.addItem(
                 f"Argon2id (m={ARGON2_MEMORY_KIB//1024}MiB, t={ARGON2_TIME}, p={ARGON2_PARALLELISM}) — memory-hard",
                 KDF_ARGON2ID,
             )
+            self.create_kdf_combo.setCurrentIndex(1)
         else:
             self.create_kdf_combo.addItem(
                 "Argon2id (install argon2-cffi to enable)",
                 KDF_ARGON2ID,
             )
-            # Keep selectable but build_bca will raise a clear error if chosen.
-        self.create_kdf_combo.setCurrentIndex(0)
+            self.create_kdf_combo.setCurrentIndex(0)
         auth.addWidget(self.create_kdf_combo, 3, 1)
         auth.addWidget(QLabel(), 4, 0)
         self.create_status = QLabel()
@@ -2963,19 +2970,27 @@ class VaultView(QWidget):
         top = QHBoxLayout()
         top.addWidget(self._section_label("UNSEALED CONTENT"))
         top.addStretch(1)
+        self.add_to_vault_btn = QPushButton("➕ ADD FILES")
+        self.add_to_vault_btn.clicked.connect(self._add_files_to_open_vault)
+        top.addWidget(self.add_to_vault_btn)
+        self.save_vault_btn = QPushButton("💾 SAVE / APPLY")
+        self.save_vault_btn.setObjectName("primaryButton")
+        self.save_vault_btn.clicked.connect(self._save_open_vault)
+        top.addWidget(self.save_vault_btn)
         self.close_vault_btn = QPushButton("PURGE VAULT FROM RAM")
         self.close_vault_btn.setObjectName("dangerButton")
         self.close_vault_btn.clicked.connect(self._close_vault)
         top.addWidget(self.close_vault_btn)
         ec.addLayout(top)
+        self.vault_edit_status = QLabel("")
+        self.vault_edit_status.setFont(_font(11, "Consolas"))
+        self.vault_edit_status.setStyleSheet(f"color:{TEMPLE_GOLD_BRONZE};")
+        ec.addWidget(self.vault_edit_status)
         self.entries_scroll = QScrollArea()
         self.entries_scroll.setWidgetResizable(True)
         self.entries_scroll.setFrameShape(QFrame.NoFrame)
         self.entries_scroll.setMinimumHeight(320)
         self.entries_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # Explicit backgrounds on the scroll area and its viewport avoid the
-        # OS-themed (often white, on Windows) fallback background painting
-        # through before/around our own styled widgets.
         self.entries_scroll.setStyleSheet(f"QScrollArea{{background:transparent; border:none;}} QScrollArea > QWidget > QWidget{{background:transparent;}}")
         self.entries_scroll.viewport().setAutoFillBackground(True)
         _pal = self.entries_scroll.viewport().palette()
@@ -3056,6 +3071,14 @@ class VaultView(QWidget):
         pw2=self.create_pw_confirm_entry.text()
         if not pw1:
             QMessageBox.warning(self,"Vault","Enter a password.")
+            return
+        if len(pw1) < VAULT_PASSWORD_MIN_LEN:
+            QMessageBox.warning(
+                self,
+                "Vault",
+                f"Password must be at least {VAULT_PASSWORD_MIN_LEN} characters.\n"
+                "Longer, unique passphrases resist offline guessing far better.",
+            )
             return
         if pw1!=pw2:
             QMessageBox.warning(self,"Vault","The two passwords do not match.")
@@ -3155,10 +3178,18 @@ class VaultView(QWidget):
         self.open_status.setText("Reading file...")
         self.open_status.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
         def worker(progress_emit):
+            with open(path,"rb") as f:
+                raw=bytearray(f.read())
+            kdf_id = KDF_PBKDF2
+            if len(raw) >= 6 and raw[4] == BCA_VERSION_V2:
+                kdf_id = int(raw[5])
+            pw_keep = bytearray(password_buf)
             try:
-                with open(path,"rb") as f:
-                    raw=bytearray(f.read())
-                return parse_bca(raw,password_buf,progress_emit)
+                entries = parse_bca(raw, password_buf, progress_emit)
+                return (entries, pw_keep, kdf_id)
+            except Exception:
+                wipe_bytearray(pw_keep)
+                raise
             finally:
                 wipe_bytearray(password_buf)
         t=TaskThread(worker,self)
@@ -3173,15 +3204,25 @@ class VaultView(QWidget):
         self.open_progress.setValue(pct)
         self.open_status.setText(msg)
     @Slot(object)
-    def _on_open_success(self, entries):
+    def _on_open_success(self, result):
         self.open_spinner.stop()
         self.open_progress.hide()
         self._set_busy(self.open_spinner, [self.open_pw_entry, self.open_btn], False)
+        if isinstance(result, tuple) and len(result) == 3:
+            entries, pw_keep, kdf_id = result
+        else:
+            entries, pw_keep, kdf_id = result, None, KDF_PBKDF2
+        if self._open_password is not None:
+            wipe_bytearray(self._open_password)
+        self._open_password = pw_keep
+        self._open_kdf_id = kdf_id if kdf_id in (KDF_PBKDF2, KDF_ARGON2ID) else KDF_PBKDF2
+        self._vault_dirty = False
         self._open_entries = entries
         self.open_status.setText(
             f"✓ Vault unlocked · {len(entries)} file(s) · data only in RAM"
         )
         self.open_status.setStyleSheet(f"color:{TEMPLE_EMERALD};")
+        self.vault_edit_status.setText("")
         self._render_entries_list()
         self.select_card.hide()
         self.auth_card.hide()
@@ -3197,8 +3238,16 @@ class VaultView(QWidget):
                 "Out of memory while unlocking the vault.\n"
                 "Close other applications or try a smaller archive."
             )
-        elif "Layer 1" in message or "Layer 2" in message:
-            friendly = "Wrong password or corrupted/tampered archive."
+        elif (
+            "Wrong password" in message
+            or "padding" in message.lower()
+            or "authenticity" in message.lower()
+            or "Layer 1" in message
+            or "Layer 2" in message
+            or "Void Payload" in message
+            or "ciphertext length" in message.lower()
+        ):
+            friendly = _BCA_AUTH_FAIL
         else:
             friendly = message
         QMessageBox.critical(self, "Vault", friendly)
@@ -3232,13 +3281,14 @@ class VaultView(QWidget):
             exp=QPushButton("⇩ Export")
             exp.clicked.connect(lambda _=False,e=entry:self._export_entry(e))
             rl.addWidget(exp)
+            rem=QPushButton("✕ Remove")
+            rem.setObjectName("dangerButton")
+            rem.clicked.connect(lambda _=False,e=entry:self._remove_open_entry(e))
+            rl.addWidget(rem)
             self.entries_layout.addWidget(row)
         self.entries_layout.addStretch(1)
     def _preview_entry(self,entry):
         kind=classify_extension(entry.name)
-        # High soft ceilings so large legitimate media still previews. Absolute
-        # safety still rests on magic sniffing, pixel/page bombs, timeouts,
-        # restricted library options, and (where used) child-process RLIMIT.
         MAX_PREVIEW_BYTES = {
             ViewerKind.IMAGE: 400 * 1024 * 1024,   # 400 MiB
             ViewerKind.PDF:   350 * 1024 * 1024,   # 350 MiB
@@ -3272,7 +3322,6 @@ class VaultView(QWidget):
             if box.exec()!=QMessageBox.Yes:
                 return
         data=bytes(entry.data)
-        # Layer 1: magic / structural sniff before any library sees the bytes.
         try:
             if kind in (ViewerKind.IMAGE, ViewerKind.PDF, ViewerKind.AUDIO, ViewerKind.VIDEO):
                 _sniff_media_kind(data, kind)
@@ -3316,12 +3365,8 @@ class VaultView(QWidget):
                 "Export the file and inspect it with a dedicated external tool if needed.",
             )
         finally:
-            # Drop the temporary copy and encourage GC so large media does not linger.
             try:
-                # Best-effort wipe of the preview copy (not the vault entry).
                 if isinstance(data, (bytes, bytearray)):
-                    # bytes are immutable; allocate a transient wipe buffer only
-                    # if we still hold a mutable view (defensive).
                     pass
                 del data
             except Exception:
@@ -3601,10 +3646,6 @@ class VaultView(QWidget):
         def slider_release():
             if duration:
                 raw = slider.value() / 1000.0 * duration
-                # Tiny margin: allow scrubbing almost to the reported end.
-                # If the decoded stream is shorter (common with m4a padding),
-                # play_audio will start near the end and the poll timer will
-                # mark Finished once the mixer reports idle.
                 margin = 0.05
                 target = min(raw, max(0.0, duration - margin))
                 if raw >= duration - margin:
@@ -3657,13 +3698,6 @@ class VaultView(QWidget):
                         slider.setValue(min(1000,int(pos/duration*1000)))
                     time_label.setText(f"{self._fmt_time(min(pos,duration))} / {self._fmt_time(duration)}")
             elif time.monotonic()-state["started_at"]>0.6:
-                # Playback reached the end of the actual decoded audio on
-                # its own (not a user pause/stop). This can happen a little
-                # before the container's reported duration -- formats like
-                # m4a often carry encoder priming/padding samples, so the
-                # real decoded length can be a touch shorter than what the
-                # file's metadata claims. Reflect that the track has ended
-                # instead of leaving the controls stuck mid-track.
                 state["stopped"]=True; state["offset"]=0; slider.setValue(1000 if duration else 0)
                 if duration:
                     time_label.setText(f"{self._fmt_time(duration)} / {self._fmt_time(duration)}")
@@ -3773,11 +3807,6 @@ class VaultView(QWidget):
                 def on_finished(th=th, requested_at=at):
                     if th.got_any_frame or state.get("thread") is not th:
                         return
-                    # The seek landed past the last frame ffmpeg could
-                    # actually decode (see the margin note in seek()) and
-                    # came back empty. Rather than leaving the player stuck
-                    # with nothing on screen, fall back to the last position
-                    # that did produce a frame.
                     fallback = min(requested_at, state.get("last_time", 0.0))
                     if fallback < requested_at:
                         start_decode(fallback)
@@ -3813,16 +3842,10 @@ class VaultView(QWidget):
             def seek():
                 if info.duration:
                     frame_interval = 1.0/info.fps if info.fps>0 else 0.04
-                    # Keep only a tiny margin so the scrubber can reach near
-                    # the true end. If ffmpeg returns no frame (container
-                    # padding past last decodable frame), the finishedDecoding
-                    # handler falls back to the last good timestamp instead of
-                    # leaving the player stuck.
                     margin = max(frame_interval, 0.05)
                     raw = slider.value() / 1000.0 * info.duration
                     target = min(raw, max(0.0, info.duration - margin))
                     if raw >= info.duration - margin:
-                        # User scrubbed to the very end: treat as finished.
                         state["playing"] = False
                         state["last_time"] = info.duration
                         slider.setValue(1000)
@@ -3906,10 +3929,152 @@ class VaultView(QWidget):
         t.failed.connect(lambda msg:QMessageBox.critical(self,"Export failed",msg))
         t.start()
         t.finished.connect(lambda:t.deleteLater())
+    def _mark_vault_dirty(self):
+        self._vault_dirty = True
+        n = len(self._open_entries)
+        self.vault_edit_status.setText(
+            f"Unsaved changes · {n} file(s) in memory · click SAVE / APPLY to write the archive"
+        )
+        self.vault_edit_status.setStyleSheet(f"color:{TEMPLE_AMBER};")
+    def _remove_open_entry(self, entry):
+        if entry not in self._open_entries:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Remove from vault")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Remove '{entry.name}' from this vault?\n\nThis only affects memory until you click SAVE / APPLY.")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        if box.exec() != QMessageBox.Yes:
+            return
+        self._open_entries.remove(entry)
+        wipe_bytearray(entry.data)
+        self._mark_vault_dirty()
+        self._render_entries_list()
+    def _add_files_to_open_vault(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add files to vault")
+        if not paths:
+            return
+        existing = {e.name for e in self._open_entries}
+        added = 0
+        errors = []
+        for path in paths:
+            name = os.path.basename(path)
+            if name in existing:
+                errors.append(f"{name}: already in vault (skipped)")
+                continue
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                self._open_entries.append(
+                    VaultDecryptedEntry(name=name, data=bytearray(raw), crc_ok=True)
+                )
+                existing.add(name)
+                added += 1
+            except OSError as exc:
+                errors.append(f"{name}: {exc}")
+        if added:
+            self._mark_vault_dirty()
+            self._render_entries_list()
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Add files",
+                f"Added {added} file(s).\n\n" + "\n".join(errors[:12]),
+            )
+        elif added:
+            QMessageBox.information(self, "Add files", f"Added {added} file(s) to the open vault.")
+    def _save_open_vault(self):
+        if not self._bca_path:
+            QMessageBox.warning(self, "Vault", "No archive path is associated with this session.")
+            return
+        if self._open_password is None:
+            QMessageBox.warning(
+                self,
+                "Vault",
+                "The session password is no longer in memory. Close and reopen the vault to save.",
+            )
+            return
+        if not self._open_entries:
+            QMessageBox.warning(
+                self,
+                "Vault",
+                "The vault is empty. Add at least one file, or purge the session without saving.",
+            )
+            return
+        path = self._bca_path
+        kdf_id = self._open_kdf_id
+        password_buf = bytearray(self._open_password)
+        entries = [
+            VaultFileEntry(name=e.name, data=bytearray(e.data))
+            for e in self._open_entries
+        ]
+        self.save_vault_btn.setEnabled(False)
+        self.add_to_vault_btn.setEnabled(False)
+        self.vault_edit_status.setText("Writing archive…")
+        self.vault_edit_status.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
+        def worker(progress_emit):
+            try:
+                archive = build_bca(entries, password_buf, progress_emit, kdf_id=kdf_id)
+                tmp_path = path + ".bca-tmp"
+                try:
+                    with open(tmp_path, "wb") as f:
+                        f.write(bytes(archive))
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                wipe_bytearray(archive)
+                return path
+            finally:
+                wipe_bytearray(password_buf)
+                for e in entries:
+                    wipe_bytearray(e.data)
+        t = TaskThread(worker, self)
+        t.succeeded.connect(self._on_save_open_success)
+        t.failed.connect(self._on_save_open_error)
+        t.finished.connect(lambda: t.deleteLater())
+        self._retain_thread(t)
+        t.start()
+    @Slot(object)
+    def _on_save_open_success(self, path):
+        self.save_vault_btn.setEnabled(True)
+        self.add_to_vault_btn.setEnabled(True)
+        self._vault_dirty = False
+        self.vault_edit_status.setText(f"✓ Saved · {len(self._open_entries)} file(s) · {path}")
+        self.vault_edit_status.setStyleSheet(f"color:{TEMPLE_EMERALD};")
+        QMessageBox.information(self, "Vault", f"Archive updated:\n{path}")
+        gc.collect()
+    @Slot(str)
+    def _on_save_open_error(self, message):
+        self.save_vault_btn.setEnabled(True)
+        self.add_to_vault_btn.setEnabled(True)
+        self.vault_edit_status.setText("Save failed")
+        self.vault_edit_status.setStyleSheet(f"color:{TEMPLE_AMBER};")
+        QMessageBox.critical(self, "Save failed", message)
     def _close_vault(self):
+        if self._vault_dirty:
+            box = QMessageBox(self)
+            box.setWindowTitle("Unsaved changes")
+            box.setIcon(QMessageBox.Warning)
+            box.setText(
+                "This vault has unsaved changes in memory.\n\n"
+                "Close without saving? The on-disk archive will keep its previous contents."
+            )
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            if box.exec() != QMessageBox.Yes:
+                return
         for entry in self._open_entries:
             wipe_bytearray(entry.data)
         self._open_entries = []
+        if self._open_password is not None:
+            wipe_bytearray(self._open_password)
+            self._open_password = None
+        self._vault_dirty = False
         self._render_entries_list()
         self.entries_card.hide()
         self.select_card.show()
@@ -3920,7 +4085,10 @@ class VaultView(QWidget):
         self.open_status.setText("Vault closed · Data wiped from RAM.")
         self.open_status.setStyleSheet(f"color:{TEMPLE_GOLD_BRONZE};")
         self.open_pw_entry.clear()
-        # Multiple GC passes help return large media pages to the OS sooner.
+        try:
+            self.vault_edit_status.setText("")
+        except Exception:
+            pass
         for _ in range(3):
             gc.collect()
     def wipe_all_on_exit(self):
@@ -3930,6 +4098,10 @@ class VaultView(QWidget):
             wipe_bytearray(entry.data)
         self._open_entries = []
         self._pending_create_entries = []
+        if self._open_password is not None:
+            wipe_bytearray(self._open_password)
+            self._open_password = None
+        self._vault_dirty = False
         try:
             self.create_pw_entry.clear()
             self.create_pw_confirm_entry.clear()
@@ -4093,13 +4265,6 @@ class BastetCipherApp(QMainWindow):
         except Exception:
             pass
         event.accept()
-
-# =============================================================================
-# BASTET AUDIT TOOL -- embedded, independent security-checking utility.
-# Opened by clicking the Bastet emblem on the home screen. Runs entirely
-# in its own thread with its own Tk window; does not touch the Qt app's
-# state, and only reads (never modifies) this source file.
-# =============================================================================
 
 _AUDIT_TOOL_DOC = """
 |===========================================|
@@ -5493,16 +5658,6 @@ if _AUDIT_TK_AVAILABLE:
 # =============================================================================
 
 def apply_cross_platform_style(app: QApplication) -> None:
-    """Force the Fusion style on all platforms.
-
-    On Windows, PySide6 otherwise defaults to the native 'windowsvista'
-    style, which renders several custom-painted/stylesheet-heavy widgets
-    (GlowFrame cards, QScrollArea viewports, etc.) incorrectly and can
-    flash the OS theme's white background before the stylesheet paints
-    over it (most visible on Windows 10 when opening an archive). Fusion
-    is a consistent, cross-platform style that respects QSS everywhere,
-    which avoids both problems.
-    """
     try:
         app.setStyle(QStyleFactory.create("Fusion"))
     except Exception:
