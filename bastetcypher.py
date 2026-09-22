@@ -38,6 +38,7 @@ from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QEasingCurve, QPro
 from PySide6.QtGui import QPixmap, QImage, QIcon, QPainter, QPainterPath, QColor, QFont, QLinearGradient, QRadialGradient, QPen, QBrush, QAction, QPalette
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QLineEdit, QTextEdit, QPlainTextEdit,
+    QTextBrowser,
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QTabWidget, QScrollArea, QFileDialog, QMessageBox,
     QProgressBar, QSlider, QDialog, QSizePolicy, QComboBox, QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
     QToolButton, QSplitter, QAbstractItemView, QListWidget, QListWidgetItem, QDialogButtonBox, QCheckBox,
@@ -887,6 +888,7 @@ class ViewerKind(Enum):
     IMAGE = auto()
     PDF = auto()
     TEXT = auto()
+    HTML = auto()
     AUDIO = auto()
     VIDEO = auto()
     UNSUPPORTED = auto()
@@ -895,11 +897,12 @@ IMAGE_EXTENSIONS = {
     ".heic", ".heif", ".avif", ".psd", ".raw", ".cr2", ".nef",
 }
 TEXT_EXTENSIONS = {
-    ".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".html", ".css",
+    ".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".css",
     ".xml", ".yaml", ".yml", ".ini", ".cfg", ".sh", ".c", ".cpp", ".h",
     ".java", ".rs", ".go", ".rb", ".php", ".sql",
     ".srt", ".vtt", ".ass", ".ssa",
 }
+HTML_EXTENSIONS = {".html", ".htm"}
 PDF_EXTENSIONS = {".pdf"}
 AUDIO_EXTENSIONS = {
     ".mp3", ".ogg", ".wav", ".flac", ".aac", ".m4a", ".wma",
@@ -918,6 +921,8 @@ def classify_extension(filename: str) -> ViewerKind:
         return ViewerKind.IMAGE
     if ext in PDF_EXTENSIONS:
         return ViewerKind.PDF
+    if ext in HTML_EXTENSIONS:
+        return ViewerKind.HTML
     if ext in TEXT_EXTENSIONS:
         return ViewerKind.TEXT
     if ext in AUDIO_EXTENSIONS:
@@ -1246,6 +1251,64 @@ def decode_text_in_memory(data: bytes) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return data.decode("latin-1")
+
+
+_HTML_STRIP_BLOCK_RE = re.compile(
+    r"<\s*(script|style|iframe|frame|frameset|object|embed|applet|form|"
+    r"input|button|textarea|select|option|link|meta|base|svg|math|"
+    r"video|audio|source|track|noscript|template)\b[^>]*>.*?<\s*/\s*\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_STRIP_SINGLE_RE = re.compile(
+    r"<\s*(?:script|style|iframe|frame|frameset|object|embed|applet|form|"
+    r"input|button|textarea|select|option|link|meta|base|svg|math|"
+    r"video|audio|source|track|noscript|template)\b[^>]*/?\s*>",
+    re.IGNORECASE,
+)
+_HTML_ONATTR_RE = re.compile(
+    r"\s+on[a-zA-Z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
+    re.IGNORECASE,
+)
+_HTML_BAD_SCHEME_QUOTED_RE = re.compile(
+    r"(?i)\b(href|src|action|formaction|xlink:href)\s*=\s*(['\"])\s*"
+    r"(?:javascript|data|vbscript|https?|ftp|file)\s*:[^'\"]*\2",
+)
+_HTML_BAD_SCHEME_BARE_RE = re.compile(
+    r"(?i)\b(href|src|action|formaction|xlink:href)\s*=\s*"
+    r"(?:javascript|data|vbscript|https?|ftp|file)\s*:[^\s>]*",
+)
+
+
+_HTML_CENTER_OPEN_RE = re.compile(r"<\s*center\b[^>]*>", re.IGNORECASE)
+_HTML_CENTER_CLOSE_RE = re.compile(r"<\s*/\s*center\s*>", re.IGNORECASE)
+_HTML_A_NAME_RE = re.compile(
+    r"<\s*a\b([^>]*?)\bname\s*=\s*(['\"])([^'\"]+)\2([^>]*)>",
+    re.IGNORECASE,
+)
+
+
+def sanitize_html_for_preview(html: str) -> str:
+    if not html:
+        return ""
+    limit = 256 * 1024 * 1024
+    if len(html) > limit:
+        html = html[:limit]
+    html = _HTML_STRIP_BLOCK_RE.sub("", html)
+    html = _HTML_STRIP_SINGLE_RE.sub("", html)
+    html = _HTML_ONATTR_RE.sub("", html)
+    html = _HTML_BAD_SCHEME_QUOTED_RE.sub(r'\1="#"', html)
+    html = _HTML_BAD_SCHEME_BARE_RE.sub('href="#"', html)
+    html = _HTML_CENTER_OPEN_RE.sub('<div align="center">', html)
+    html = _HTML_CENTER_CLOSE_RE.sub("</div>", html)
+    def _name_to_id(m: re.Match) -> str:
+        before, quote, name, after = m.group(1), m.group(2), m.group(3), m.group(4)
+        if re.search(r"\bid\s*=", before + after, re.IGNORECASE):
+            return m.group(0)
+        return f'<a{before}name={quote}{name}{quote} id={quote}{name}{quote}{after}>'
+    html = _HTML_A_NAME_RE.sub(_name_to_id, html)
+    return html
+
+
 @dataclass
 class VideoInfo:
     width: int
@@ -3343,6 +3406,7 @@ class VaultView(QWidget):
             ViewerKind.AUDIO: 500 * 1024 * 1024,   # 500 MiB
             ViewerKind.VIDEO: 1024 * 1024 * 1024,  # 1 GiB
             ViewerKind.TEXT:  32 * 1024 * 1024,    # 32 MiB
+            ViewerKind.HTML:  256 * 1024 * 1024,   # 256 MiB
         }
         limit = MAX_PREVIEW_BYTES.get(kind, 64 * 1024 * 1024)
         if len(entry.data) > limit:
@@ -3396,6 +3460,8 @@ class VaultView(QWidget):
                 self._preview_pdf(dialog,data)
             elif kind==ViewerKind.TEXT:
                 self._preview_text(dialog,data)
+            elif kind==ViewerKind.HTML:
+                self._preview_html(dialog,data)
             elif kind==ViewerKind.AUDIO:
                 self._preview_audio(dialog,data,entry.name)
             elif kind==ViewerKind.VIDEO:
@@ -3663,6 +3729,83 @@ class VaultView(QWidget):
         box.setFont(_font(12,"Consolas"))
         box.setPlainText(decode_text_in_memory(data))
         root.addWidget(box)
+    def _preview_html(self, dialog, data):
+        root = QVBoxLayout(dialog)
+        notice = QLabel(
+            "Locked-down HTML preview · no JavaScript · no remote resources · "
+            "in-document links enabled"
+        )
+        notice.setFont(_font(11, "Consolas"))
+        notice.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
+        root.addWidget(notice)
+        status = QLabel("Preparing HTML…")
+        status.setFont(_font(12, "Consolas"))
+        status.setStyleSheet(f"color:{TEMPLE_GOLD_SUN};")
+        root.addWidget(status)
+        browser = QTextBrowser()
+        browser.setReadOnly(True)
+        browser.setOpenExternalLinks(False)
+        browser.setOpenLinks(False)
+        browser.setSearchPaths([])
+        try:
+            browser.document().setDefaultStyleSheet(
+                "body { line-height: 1.45; }"
+                "p, div, li { margin-top: 0.55em; margin-bottom: 0.55em; }"
+                "h1, h2, h3, h4, h5, h6 { margin-top: 0.9em; margin-bottom: 0.45em; }"
+                "ul, ol { margin: 0.55em 0 0.55em 1.4em; }"
+                "table { margin: 0.7em 0; border-collapse: collapse; }"
+                "td, th { padding: 0.25em 0.5em; }"
+            )
+        except Exception:
+            pass
+
+        def on_anchor(url):
+            try:
+                scheme = (url.scheme() or "").lower()
+                if scheme in (
+                    "http", "https", "ftp", "file", "javascript",
+                    "data", "vbscript", "mailto",
+                ):
+                    return
+                frag = url.fragment()
+                if frag:
+                    browser.scrollToAnchor(frag)
+                    return
+                text = url.toString()
+                if text.startswith("#") and len(text) > 1:
+                    browser.scrollToAnchor(text[1:])
+                    return
+                path = (url.path() or "").lstrip("./")
+                if path and not scheme:
+                    browser.scrollToAnchor(path)
+            except Exception:
+                pass
+
+        browser.anchorClicked.connect(on_anchor)
+        root.addWidget(browser, 1)
+
+        def worker(_progress):
+            raw = decode_text_in_memory(data)
+            return sanitize_html_for_preview(raw)
+
+        def on_ready(safe):
+            status.setText("Rendering…")
+            browser.setHtml(safe)
+            status.setText(
+                f"Ready · {len(safe) / (1024 * 1024):.1f} MiB sanitized · "
+                "click in-page links to navigate"
+            )
+            status.setStyleSheet(f"color:{TEMPLE_EMERALD};")
+
+        def on_fail(msg):
+            status.setText(f"HTML preview failed: {msg}")
+            status.setStyleSheet(f"color:{TEMPLE_AMBER};")
+
+        t = TaskThread(worker, dialog)
+        t.succeeded.connect(on_ready)
+        t.failed.connect(on_fail)
+        t.finished.connect(t.deleteLater)
+        t.start()
     def _preview_audio(self,dialog,data,name):
         root=QVBoxLayout(dialog)
         icon=QLabel("🎵"); icon.setAlignment(Qt.AlignCenter); icon.setFont(_font(52))
@@ -4627,6 +4770,13 @@ def extract_core_crypto_module(source_path, dest_path):
         "from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC\n"
         "from cryptography.hazmat.primitives import hashes\n"
         "from cryptography.hazmat.backends import default_backend\n"
+        "try:\n"
+        "    from argon2.low_level import hash_secret_raw, Type as Argon2Type\n"
+        "    _HAS_ARGON2 = True\n"
+        "except ImportError:\n"
+        "    _HAS_ARGON2 = False\n"
+        "    hash_secret_raw = None\n"
+        "    Argon2Type = None\n"
         "\n"
         "ProgressCallback = Callable[[int, str], None]\n"
         "def _noop_progress(pct, msg):\n"
@@ -4673,6 +4823,8 @@ with atheris.instrument_imports():
     import bca_core_standalone
 
 bca_core_standalone.BCA_ITERS = 1000
+bca_core_standalone.BCA_ITERS_MIN = 1
+bca_core_standalone.BCA_ITERS_MAX = 5_000_000
 
 FIXED_PASSWORD = bytearray(b"FixedFuzzingPassword123!")
 
@@ -4830,22 +4982,37 @@ print(json.dumps(results, indent=2))
 MEMORY_TEST_CODE = r'''"""
 Basic memory-behavior check via tracemalloc.
 Generated by bastet_audit_gui.py.
+Exercises both PBKDF2 and Argon2id (when argon2-cffi is available).
 """
 import sys, os, gc, tracemalloc, json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bca_core_standalone import build_bca, parse_bca, VaultFileEntry, BCAFormatError, BCADecryptError
+from bca_core_standalone import (
+    build_bca, parse_bca, VaultFileEntry, BCAFormatError, BCADecryptError,
+    KDF_PBKDF2, KDF_ARGON2ID,
+)
 import bca_core_standalone
 
 bca_core_standalone.BCA_ITERS = 2000
+bca_core_standalone.BCA_ITERS_MIN = 1
+bca_core_standalone.BCA_ITERS_MAX = 5_000_000
+if hasattr(bca_core_standalone, "ARGON2_MEMORY_KIB"):
+    bca_core_standalone.ARGON2_MEMORY_KIB = 8 * 1024
+    bca_core_standalone.ARGON2_TIME = 1
+    bca_core_standalone.ARGON2_PARALLELISM = 1
 
 N_CYCLES = 300
 password = bytearray(b"MemoryTestPassword!2024")
 
-def run_cycle():
+_HAS_ARGON2 = bool(getattr(bca_core_standalone, "_HAS_ARGON2", False))
+KDF_SEQUENCE = [KDF_PBKDF2]
+if _HAS_ARGON2:
+    KDF_SEQUENCE.append(KDF_ARGON2ID)
+
+def run_cycle(kdf_id=KDF_PBKDF2):
     pw = bytearray(password)
     entry = VaultFileEntry(name="test.bin", data=bytearray(os.urandom(20000)))
-    buf = build_bca([entry], pw)
+    buf = build_bca([entry], pw, kdf_id=kdf_id)
     pw2 = bytearray(password)
     entries = parse_bca(bytearray(buf), pw2)
     return entries
@@ -4853,13 +5020,13 @@ def run_cycle():
 tracemalloc.start()
 gc.collect()
 
-for _ in range(20):
-    run_cycle()
+for i in range(20):
+    run_cycle(KDF_SEQUENCE[i % len(KDF_SEQUENCE)])
 gc.collect()
 warm_snapshot = tracemalloc.take_snapshot()
 
-for _ in range(N_CYCLES):
-    run_cycle()
+for i in range(N_CYCLES):
+    run_cycle(KDF_SEQUENCE[i % len(KDF_SEQUENCE)])
 gc.collect()
 final_snapshot = tracemalloc.take_snapshot()
 
@@ -4872,6 +5039,7 @@ top_diffs = final_snapshot.compare_to(warm_snapshot, "lineno")[:8]
 
 result = {
     "cycles_run": N_CYCLES,
+    "kdfs_exercised": ["PBKDF2"] + (["Argon2id"] if _HAS_ARGON2 else []),
     "memory_after_warmup_bytes": warm_total,
     "memory_after_all_cycles_bytes": final_total,
     "growth_bytes": growth_bytes,
@@ -4881,6 +5049,7 @@ result = {
         "growth_bytes_per_cycle above ~2KB/cycle after warmup may indicate "
         "a Python-level leak worth investigating; small positive values are "
         "normal GC/allocator noise."
+        + ("" if _HAS_ARGON2 else " Argon2id skipped (argon2-cffi not installed in audit env).")
     ),
     "top_allocation_diffs": [str(d) for d in top_diffs],
 }
@@ -5368,7 +5537,7 @@ if _AUDIT_TK_AVAILABLE:
                 self._log(r.stdout + r.stderr)
 
                 self._log("\n=== Installing required packages ===\n", "ok")
-                for pkg in ["cryptography", "pip-audit", "bandit"]:
+                for pkg in ["cryptography", "argon2-cffi", "pip-audit", "bandit"]:
                     self._log("--- {} ---\n".format(pkg))
                     proc = subprocess.Popen([venv_python(), "-m", "pip", "install", "--quiet", pkg],
                                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
