@@ -2582,9 +2582,9 @@ class HubView(QWidget):
         portal_row.setSpacing(128)
         portal_row.setAlignment(Qt.AlignCenter)
         self.gen_btn = PortalButton("۞", "CIPHER GENERATOR",
-                           "Forge a deterministic high-entropy secret from phrase + PIM.")
+                           "Forge a deterministic high-entropy secret from phrase + PIM and amplificator.")
         self.vault_btn = PortalButton("▦", "SACRED VAULT",
-                             "Encrypt, unlock, preview, export and purge protected .bstarc archives (legacy .bca supported).")
+                             "Encrypt, unlock, preview, export and purge protected.")
         self.gen_btn.clicked.connect(lambda: self.openView.emit("generator"))
         self.vault_btn.clicked.connect(lambda: self.openView.emit("vault"))
         gen = self.gen_btn
