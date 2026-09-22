@@ -528,6 +528,10 @@ def run_cipher_pipeline(
 BCA_MAGIC = bytes([0x42, 0x43, 0x41, 0x01])
 BCA_VERSION = 1
 BCA_VERSION_V2 = 2
+ARCHIVE_EXT = ".bstarc"
+ARCHIVE_EXT_LEGACY = ".bca"
+ARCHIVE_FILTER = "Bastet Archive (*.bstarc *.bca);;Bastet Archive new (*.bstarc);;Legacy Bastet (*.bca);;All files (*)"
+ARCHIVE_SAVE_FILTER = "Bastet Archive (*.bstarc);;Legacy Bastet (*.bca);;All files (*)"
 BCA_ITERS = 310_000
 BCA_ITERS_LEGACY = 200_000
 BCA_ITERS_MIN = 100_000
@@ -2505,7 +2509,7 @@ class HubView(QWidget):
         self.gen_btn = PortalButton("۞", "CIPHER GENERATOR",
                            "Forge a deterministic high-entropy secret from phrase + PIM.")
         self.vault_btn = PortalButton("▦", "SACRED VAULT",
-                             "Encrypt, unlock, preview, export and purge protected .bca archives.")
+                             "Encrypt, unlock, preview, export and purge protected .bstarc archives (legacy .bca supported).")
         self.gen_btn.clicked.connect(lambda: self.openView.emit("generator"))
         self.vault_btn.clicked.connect(lambda: self.openView.emit("vault"))
         gen = self.gen_btn
@@ -2954,7 +2958,7 @@ class VaultView(QWidget):
         self.select_card = GlowFrame(radius=18)
         sl = QVBoxLayout(self.select_card)
         sl.setContentsMargins(22,22,22,22)
-        self.open_dz_label = QLabel("📁  SELECT A .BCA ARCHIVE")
+        self.open_dz_label = QLabel("📁  SELECT A BASTET ARCHIVE")
         self.open_dz_label.setAlignment(Qt.AlignCenter)
         self.open_dz_label.setFont(_font(21, "Georgia", True))
         self.open_dz_label.setStyleSheet(f"color:{TEMPLE_GOLD_SUN};")
@@ -2962,7 +2966,7 @@ class VaultView(QWidget):
         self.open_dz_sub.setAlignment(Qt.AlignCenter)
         self.open_dz_sub.setFont(_font(12, "Georgia", False, True))
         self.open_dz_sub.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
-        browse = QPushButton("BROWSE .BCA")
+        browse = QPushButton("BROWSE ARCHIVE")
         browse.clicked.connect(self._choose_bca_file)
         sl.addWidget(self.open_dz_label)
         sl.addWidget(self.open_dz_sub)
@@ -3113,12 +3117,13 @@ class VaultView(QWidget):
             QMessageBox.warning(self,"Vault","The two passwords do not match.")
             return
         save_path,_=QFileDialog.getSaveFileName(
-            self,"Save archive as...",filter="BastetCipher Archive (*.bca)"
+            self,"Save archive as...",filter=ARCHIVE_SAVE_FILTER
         )
         if not save_path:
             return
-        if not save_path.lower().endswith(".bca"):
-            save_path += ".bca"
+        lower = save_path.lower()
+        if not (lower.endswith(ARCHIVE_EXT) or lower.endswith(ARCHIVE_EXT_LEGACY)):
+            save_path += ARCHIVE_EXT
         password_buf=bytearray(pw1.encode("utf-8"))
         kdf_id = self.create_kdf_combo.currentData()
         if kdf_id is None:
@@ -3184,7 +3189,9 @@ class VaultView(QWidget):
         else:
             QMessageBox.critical(self, "Archive creation failed", message)
     def _choose_bca_file(self):
-        path,_=QFileDialog.getOpenFileName(self,"Select .bca archive",filter="BastetCipher Archive (*.bca);;All files (*)")
+        path,_=QFileDialog.getOpenFileName(
+            self,"Select Bastet archive",filter=ARCHIVE_FILTER
+        )
         if not path:
             return
         self._bca_path=path
@@ -3192,7 +3199,7 @@ class VaultView(QWidget):
         self.open_dz_sub.setText("Ready to unlock — will be read only once")
     def _on_open_archive(self):
         if not self._bca_path:
-            QMessageBox.warning(self,"Vault","Select a .bca archive first.")
+            QMessageBox.warning(self,"Vault","Select a Bastet archive first.")
             return
         pw=self.open_pw_entry.text()
         if not pw:
@@ -4109,7 +4116,7 @@ class VaultView(QWidget):
         self.select_card.show()
         self.auth_card.show()
         self._bca_path = None
-        self.open_dz_label.setText("📁  SELECT A .BCA ARCHIVE")
+        self.open_dz_label.setText("📁  SELECT A BASTET ARCHIVE")
         self.open_dz_sub.setText("Will be opened only in memory: no data written to disk")
         self.open_status.setText("Vault closed · Data wiped from RAM.")
         self.open_status.setStyleSheet(f"color:{TEMPLE_GOLD_BRONZE};")
