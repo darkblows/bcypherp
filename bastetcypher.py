@@ -2202,14 +2202,43 @@ class SacredSpinner(QLabel):
         self.setText(self._frames[self._index])
         self._index = (self._index + 1) % len(self._frames)
 class MediaSlider(QSlider):
+    def _value_from_pos(self, event) -> int:
+        x = event.position().x() if hasattr(event, "position") else event.x()
+        try:
+            from PySide6.QtWidgets import QStyle
+            handle = max(8, int(self.style().pixelMetric(QStyle.PM_SliderLength)))
+        except Exception:
+            handle = 14
+        span = max(1, self.width() - handle)
+        ratio = max(0.0, min(1.0, (float(x) - handle / 2.0) / span))
+        return self.minimum() + int(round(ratio * (self.maximum() - self.minimum())))
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self.orientation() == Qt.Horizontal:
-            x = event.position().x() if hasattr(event, "position") else event.x()
-            ratio = max(0.0, min(1.0, float(x) / max(1, self.width())))
-            value = self.minimum() + int(ratio * (self.maximum() - self.minimum()))
-            self.setValue(value)
+            self.setSliderDown(True)
+            self.setValue(self._value_from_pos(event))
             self.sliderPressed.emit()
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.isSliderDown() and self.orientation() == Qt.Horizontal:
+            self.setValue(self._value_from_pos(event))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.orientation() == Qt.Horizontal:
+            self.setValue(self._value_from_pos(event))
+            self.setSliderDown(False)
+            self.sliderReleased.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class TaskThread(QThread):
     progress = Signal(int, str)
     succeeded = Signal(object)
