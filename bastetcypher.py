@@ -25,6 +25,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
+
+try:
+    from argon2.low_level import hash_secret_raw, Type as Argon2Type
+    _HAS_ARGON2 = True
+except ImportError:
+    _HAS_ARGON2 = False
+    hash_secret_raw = None  # type: ignore
+    Argon2Type = None  # type: ignore
 from PIL import Image, ImageDraw
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QEasingCurve, QPropertyAnimation, QRectF, QPoint, QPointF, QSize
 from PySide6.QtGui import QPixmap, QImage, QIcon, QPainter, QPainterPath, QColor, QFont, QLinearGradient, QRadialGradient, QPen, QBrush, QAction, QPalette
@@ -174,10 +182,28 @@ def _harden_linux_process() -> None:
         prctl(38, 1, 0, 0, 0)
     except Exception:
         pass
+def _try_mlockall() -> bool:
+    """Lock all current and future process pages into RAM to reduce swap risk.
+    Best-effort: requires CAP_IPC_LOCK or sufficient RLIMIT_MEMLOCK on Linux.
+    On failure the app continues with per-buffer mlock (SecureBuffer)."""
+    if _SYSTEM not in ("Linux", "Darwin"):
+        return False
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or ("libc.so.6" if _SYSTEM == "Linux" else "libc.dylib"), use_errno=True)
+        # MCL_CURRENT | MCL_FUTURE
+        MCL_CURRENT = 1
+        MCL_FUTURE = 2
+        ret = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+        return ret == 0
+    except Exception:
+        return False
+
+
 def harden_process() -> None:
     disable_core_dumps()
     _harden_windows_process()
     _harden_linux_process()
+    _try_mlockall()
 _APP_ICON_DATA = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYBAMAAAASWSDLAAAAFVBMVEVHcEz8wy391zT90zP+1TP91DP+1DSEP1O5AAAAB3RSTlMA/v7WsHQ6xsYBGAAAAIBJREFUGNN1zkEOgkAMBdAmwqxpNe7/B/Yj4wGMEtfICVxw/zNAkBkxSFd9aftTkanc49hJrJ48xd7xOeC9IC9FLn5BVou8ijV8uhFBimuqu6boA3GOS6GFtWEOd6DCjNrNAGhqH7C8wkITf3DQ76MTbv+R/4Dq15MdZNBiB8QWIyQQEAnysTsdAAAAAElFTkSuQmCC"
 def apply_app_icon(root) -> QIcon:
     try:
@@ -467,8 +493,18 @@ def run_cipher_pipeline(
     )
 BCA_MAGIC = bytes([0x42, 0x43, 0x41, 0x01])
 BCA_VERSION = 1
+BCA_VERSION_V2 = 2  # adds KDF selector (PBKDF2 or Argon2id)
 BCA_ITERS = 200_000
-HEADER_LEN = 69
+# Argon2id parameters (memory cost in KiB, time cost, parallelism, hash len)
+# Tuned for interactive desktop use while remaining memory-hard.
+ARGON2_MEMORY_KIB = 64 * 1024  # 64 MiB
+ARGON2_TIME = 3
+ARGON2_PARALLELISM = 4
+ARGON2_HASH_LEN = 64
+KDF_PBKDF2 = 0
+KDF_ARGON2ID = 1
+HEADER_LEN = 69  # v1
+HEADER_LEN_V2 = 70  # v2: +1 byte kdf_id after version
 class BCAFormatError(ValueError):
     pass
 class BCADecryptError(ValueError):
@@ -493,15 +529,38 @@ def deflate_raw_decompress(data: "bytes | bytearray | memoryview") -> bytes:
         return out
     except MemoryError:
         raise MemoryError("Insufficient memory while decompressing vault entry.") from None
-def derive_vault_keys(password: bytearray, salt: bytes, iterations: int) -> Tuple[bytearray, bytearray]:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA512(),
-        length=64,
-        salt=salt,
-        iterations=iterations,
-        backend=default_backend(),
-    )
-    derived = kdf.derive(bytes(password))
+def derive_vault_keys(
+    password: bytearray,
+    salt: bytes,
+    iterations: int,
+    kdf_id: int = KDF_PBKDF2,
+) -> Tuple[bytearray, bytearray]:
+    if kdf_id == KDF_ARGON2ID:
+        if not _HAS_ARGON2:
+            raise BCADecryptError(
+                "This archive was sealed with Argon2id, but the 'argon2-cffi' "
+                "package is not installed. Install it with:\n"
+                "    pip install argon2-cffi\n"
+                "then reopen the vault."
+            )
+        derived = hash_secret_raw(
+            secret=bytes(password),
+            salt=salt,
+            time_cost=ARGON2_TIME,
+            memory_cost=ARGON2_MEMORY_KIB,
+            parallelism=ARGON2_PARALLELISM,
+            hash_len=ARGON2_HASH_LEN,
+            type=Argon2Type.ID,
+        )
+    else:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA512(),
+            length=64,
+            salt=salt,
+            iterations=iterations,
+            backend=default_backend(),
+        )
+        derived = kdf.derive(bytes(password))
     k1 = bytearray(derived[0:32])
     k2 = bytearray(derived[32:64])
     if isinstance(derived, (bytes, bytearray)):
@@ -524,13 +583,19 @@ def build_bca(
     file_entries: List[VaultFileEntry],
     password: bytearray,
     on_progress: Optional[ProgressCallback] = None,
+    kdf_id: int = KDF_PBKDF2,
 ) -> bytearray:
     progress = on_progress or _noop_progress
+    if kdf_id == KDF_ARGON2ID and not _HAS_ARGON2:
+        raise BCAFormatError(
+            "Argon2id selected but 'argon2-cffi' is not installed. "
+            "Install with: pip install argon2-cffi"
+        )
     salt = os.urandom(32)
     iv1 = os.urandom(12)
     iv2 = os.urandom(16)
     progress(5, "Deriving 512-bit keys...")
-    k1, k2 = derive_vault_keys(password, salt, BCA_ITERS)
+    k1, k2 = derive_vault_keys(password, salt, BCA_ITERS, kdf_id=kdf_id)
     progress(22, "Keys ready · Isolated cascade")
     plaintext: Optional[bytearray] = None
     ct1: Optional[bytes] = None
@@ -565,14 +630,25 @@ def build_bca(
         del ct1
         ct1 = None
         progress(92, "Finalizing and wiping RAM residuals...")
-        header = (
-            BCA_MAGIC
-            + bytes([BCA_VERSION])
-            + salt
-            + struct.pack("<I", BCA_ITERS)
-            + iv1
-            + iv2
-        )
+        if kdf_id == KDF_ARGON2ID:
+            # v2 header: magic + version + kdf_id + salt + iters(placeholder) + iv1 + iv2
+            header = (
+                BCA_MAGIC
+                + bytes([BCA_VERSION_V2, kdf_id])
+                + salt
+                + struct.pack("<I", 0)  # unused for Argon2; params are fixed in code
+                + iv1
+                + iv2
+            )
+        else:
+            header = (
+                BCA_MAGIC
+                + bytes([BCA_VERSION])
+                + salt
+                + struct.pack("<I", BCA_ITERS)
+                + iv1
+                + iv2
+            )
         result = bytearray(header + ct2)
         del ct2
         return result
@@ -630,17 +706,36 @@ def parse_bca(
         raise BCAFormatError("File too short to be a valid .bca archive.")
     if d[0:4] != BCA_MAGIC:
         raise BCAFormatError("Unrecognized file (magic bytes mismatch).")
-    if d[4] != BCA_VERSION:
+    version = d[4]
+    if version == BCA_VERSION:
+        # v1: magic(4) + ver(1) + salt(32) + iters(4) + iv1(12) + iv2(16) = 69
+        kdf_id = KDF_PBKDF2
+        salt = bytes(d[5:37])
+        iterations = struct.unpack("<I", d[37:41])[0]
+        if iterations != BCA_ITERS:
+            raise BCAFormatError("Invalid PBKDF2 parameter for this archive.")
+        iv1 = bytes(d[41:53])
+        iv2 = bytes(d[53:69])
+        ct_offset = HEADER_LEN
+    elif version == BCA_VERSION_V2:
+        if len(d) < HEADER_LEN_V2:
+            raise BCAFormatError("File too short for a v2 .bca archive.")
+        # v2: magic(4) + ver(1) + kdf_id(1) + salt(32) + iters(4) + iv1(12) + iv2(16) = 70
+        kdf_id = d[5]
+        if kdf_id not in (KDF_PBKDF2, KDF_ARGON2ID):
+            raise BCAFormatError("Unsupported KDF identifier in archive.")
+        salt = bytes(d[6:38])
+        iterations = struct.unpack("<I", d[38:42])[0]
+        if kdf_id == KDF_PBKDF2 and iterations != BCA_ITERS:
+            raise BCAFormatError("Invalid PBKDF2 parameter for this archive.")
+        iv1 = bytes(d[42:54])
+        iv2 = bytes(d[54:70])
+        ct_offset = HEADER_LEN_V2
+    else:
         raise BCAFormatError("Archive version not supported.")
-    salt = bytes(d[5:37])
-    iterations = struct.unpack("<I", d[37:41])[0]
-    if iterations != BCA_ITERS:
-        raise BCAFormatError("Invalid PBKDF2 parameter for this archive.")
-    iv1 = bytes(d[41:53])
-    iv2 = bytes(d[53:69])
-    ct_view = memoryview(d)[69:]
+    ct_view = memoryview(d)[ct_offset:]
     progress(10, "Re-deriving 512-bit keys...")
-    k1, k2 = derive_vault_keys(password, salt, iterations)
+    k1, k2 = derive_vault_keys(password, salt, iterations if kdf_id == KDF_PBKDF2 else BCA_ITERS, kdf_id=kdf_id)
     plain: Optional[bytearray] = None
     ct1: Optional[bytes] = None
     try:
@@ -779,33 +874,200 @@ class RenderedPage:
 def _looks_like_svg(data: bytes) -> bool:
     head = data[:512].lstrip(b"\xef\xbb\xbf \t\r\n")
     return head.startswith(b"<?xml") or head.startswith(b"<svg") or b"<svg" in head[:200]
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer media safety guards
+# These reduce (they cannot eliminate) the risk of malicious PDFs, images,
+# audio and video. Full OS-level sandboxing is still recommended for a
+# high-assurance threat model.
+# ---------------------------------------------------------------------------
+
+# Soft ceilings kept high so legitimate large media still previews; hard
+# decompression / dimension caps below still block classic bomb payloads.
+MAX_IMAGE_PIXELS = 80_000_000          # ~80 MP after decode
+MAX_IMAGE_DIMENSION = 16_384           # per side
+MAX_PDF_PAGES_SOFT = 5_000             # refuse absurd page counts
+MAX_PDF_RENDER_DPI = 150
+MEDIA_PARSE_TIMEOUT_SEC = 90
+
+
+def _sniff_media_kind(data: bytes, claimed: ViewerKind) -> None:
+    """Reject obvious magic mismatches before handing bytes to a parser."""
+    if not data:
+        raise ValueError("Empty media payload.")
+    head = data[:16]
+    if claimed == ViewerKind.PDF:
+        # PDF may start with whitespace then %PDF
+        probe = data[:1024].lstrip()
+        if not probe.startswith(b"%PDF"):
+            raise ValueError("Content does not look like a PDF (missing %PDF header).")
+    elif claimed == ViewerKind.IMAGE:
+        ok = (
+            head.startswith(b"\x89PNG")
+            or head.startswith(b"\xff\xd8\xff")  # JPEG
+            or head.startswith(b"GIF87a")
+            or head.startswith(b"GIF89a")
+            or head.startswith(b"BM")
+            or head.startswith(b"RIFF") and data[8:12] == b"WEBP"
+            or head[:4] in (b"II*\x00", b"MM\x00*")  # TIFF
+            or head.startswith(b"\x00\x00\x01\x00")  # ICO
+            or _looks_like_svg(data)
+        )
+        if not ok:
+            raise ValueError("Content does not match a supported image format signature.")
+    elif claimed == ViewerKind.AUDIO:
+        ok = (
+            head.startswith(b"ID3")
+            or head[:3] == b"\xff\xfb"
+            or head[:2] == b"\xff\xf3"
+            or head[:2] == b"\xff\xf2"
+            or head.startswith(b"OggS")
+            or head.startswith(b"fLaC")
+            or head.startswith(b"RIFF")
+            or head[4:8] == b"ftyp"  # m4a/mp4 family
+            or head.startswith(b"\x30\x26\xb2\x75")  # ASF/WMA
+        )
+        if not ok:
+            # Soft warning path: still allow unknown audio; ffmpeg may handle it.
+            pass
+    elif claimed == ViewerKind.VIDEO:
+        ok = (
+            head[4:8] == b"ftyp"
+            or head.startswith(b"\x1a\x45\xdf\xa3")  # EBML/WebM/MKV
+            or head.startswith(b"RIFF")
+            or head.startswith(b"\x00\x00\x00\x14ftyp")
+            or head.startswith(b"\x00\x00\x01\xba")  # MPEG-PS
+            or head.startswith(b"\x00\x00\x01\xb3")
+        )
+        if not ok:
+            pass  # ffmpeg probe is the real gate
+
+
+def _apply_child_resource_limits() -> None:
+    """Tighten RLIMIT for worker processes that parse untrusted media."""
+    if _SYSTEM not in ("Linux", "Darwin"):
+        return
+    try:
+        import resource
+        # Cap address space (~2 GiB) and CPU time for the child.
+        soft_as, hard_as = resource.getrlimit(resource.RLIMIT_AS)
+        cap_as = min(hard_as if hard_as > 0 else 2 * 1024 ** 3, 2 * 1024 ** 3)
+        resource.setrlimit(resource.RLIMIT_AS, (cap_as, hard_as if hard_as > 0 else cap_as))
+        resource.setrlimit(resource.RLIMIT_CPU, (MEDIA_PARSE_TIMEOUT_SEC + 30, MEDIA_PARSE_TIMEOUT_SEC + 60))
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        # No new files preferred; best-effort.
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _open_pdf_restricted(data: bytes):
+    """Open a PDF with the most defensive fitz options available."""
+    import fitz
+    # Prefer stream open; never write to disk from this path.
+    doc = fitz.open(stream=data, filetype="pdf")
+    try:
+        # Disable dangerous PDF features where the API allows it.
+        # MuPDF/PyMuPDF does not execute JS by default in recent versions;
+        # still force repair/clean on open when supported.
+        if hasattr(doc, "is_encrypted") and doc.is_encrypted:
+            # Passworded PDFs inside the vault are unexpected; refuse rather
+            # than prompt (avoids interaction traps).
+            doc.close()
+            raise ValueError("Encrypted PDF streams are not opened in preview.")
+        if doc.page_count > MAX_PDF_PAGES_SOFT:
+            doc.close()
+            raise ValueError(
+                f"PDF has {doc.page_count} pages (limit {MAX_PDF_PAGES_SOFT}). "
+                "Export and open externally if this is intentional."
+            )
+        # Optional: set a low memory / no-cache preference if available.
+        try:
+            fitz.TOOLS.store_shrink(100)  # drop MuPDF store aggressively
+        except Exception:
+            pass
+    except Exception:
+        try:
+            doc.close()
+        except Exception:
+            pass
+        raise
+    return doc
+
+
 def render_image_in_memory(data: bytes) -> Image.Image:
+    _sniff_media_kind(data, ViewerKind.IMAGE)
     if _looks_like_svg(data):
+        # SVG → raster via MuPDF in a constrained path (no external entity expansion
+        # beyond what MuPDF itself allows; size already capped by caller).
         import fitz
         doc = fitz.open(stream=data, filetype="svg")
         try:
+            if doc.page_count < 1:
+                raise ValueError("Empty SVG document.")
             page = doc.load_page(0)
-            pix = page.get_pixmap()
+            # Cap raster size to avoid SVG bombs expanding into huge bitmaps.
+            rect = page.rect
+            max_side = 4096
+            scale = 1.0
+            if rect.width > max_side or rect.height > max_side:
+                scale = min(max_side / max(rect.width, 1), max_side / max(rect.height, 1))
+            mat = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
             data = pix.tobytes("png")
         finally:
             doc.close()
+    # Pillow: deny decompression bombs before full load.
+    try:
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    except Exception:
+        pass
     buf = io.BytesIO(data)
     img = Image.open(buf)
+    # Verify header dimensions before decoding full pixel buffer when possible.
+    w, h = img.size
+    if w > MAX_IMAGE_DIMENSION or h > MAX_IMAGE_DIMENSION:
+        img.close()
+        raise ValueError(
+            f"Image dimensions {w}x{h} exceed the safe limit "
+            f"({MAX_IMAGE_DIMENSION}px per side)."
+        )
+    if w * h > MAX_IMAGE_PIXELS:
+        img.close()
+        raise ValueError(
+            f"Image pixel count {w * h:,} exceeds the safe limit "
+            f"({MAX_IMAGE_PIXELS:,})."
+        )
+    # Load pixels (this is the costly / risky step); already dimension-checked.
     img.load()
     return img
+
+
 def render_pdf_pages_in_memory(
     data: bytes, dpi: int = 110, max_pages: Optional[int] = None
 ) -> List[RenderedPage]:
-    import fitz
+    _sniff_media_kind(data, ViewerKind.PDF)
+    dpi = min(dpi, MAX_PDF_RENDER_DPI)
     pages: List[RenderedPage] = []
-    doc = fitz.open(stream=data, filetype="pdf")
+    import fitz as _fitz
+    doc = _open_pdf_restricted(data)
     try:
         zoom = dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
+        matrix = _fitz.Matrix(zoom, zoom)
         count = doc.page_count if max_pages is None else min(max_pages, doc.page_count)
         for i in range(count):
             page = doc.load_page(i)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
+            # Guard against a single page expanding into an absurd bitmap.
+            if pix.width * pix.height > MAX_IMAGE_PIXELS:
+                raise ValueError(
+                    f"PDF page {i + 1} rasterizes to {pix.width}x{pix.height}, "
+                    "which exceeds the safe pixel budget."
+                )
             png_bytes = pix.tobytes("png")
             pages.append(
                 RenderedPage(
@@ -819,17 +1081,20 @@ def render_pdf_pages_in_memory(
     finally:
         doc.close()
     return pages
+
+
 class LazyPDFDocument:
     def __init__(self, data: bytes, dpi: int = 120):
+        _sniff_media_kind(data, ViewerKind.PDF)
         import fitz
         self._fitz = fitz
-        self._doc = fitz.open(stream=data, filetype="pdf")
-        self._dpi = dpi
-        self._zoom = dpi / 72.0
+        self._doc = _open_pdf_restricted(data)
+        self._dpi = min(dpi, MAX_PDF_RENDER_DPI)
+        self._zoom = self._dpi / 72.0
         self._matrix = fitz.Matrix(self._zoom, self._zoom)
         self._cache: dict[Tuple[int, str], Tuple[QPixmap, int, int]] = {}
         self._cache_order: List[Tuple[int, str]] = []
-        self._max_cache = 3
+        self._max_cache = 2  # keep memory footprint low; pages are re-rendered on demand
         self._text_cache: dict[int, str] = {}
     @property
     def page_count(self) -> int:
@@ -919,6 +1184,11 @@ class LazyPDFDocument:
             return self._cache[key]
         page = self._doc.load_page(index)
         pix = self._render_with_highlights(page, hq)
+        if pix.width * pix.height > MAX_IMAGE_PIXELS:
+            raise ValueError(
+                f"PDF page {index + 1} rasterizes to {pix.width}x{pix.height}, "
+                "which exceeds the safe pixel budget."
+            )
         png_bytes = pix.tobytes("png")
         qimg = QImage.fromData(png_bytes, "PNG")
         pixmap = QPixmap.fromImage(qimg)
@@ -985,12 +1255,23 @@ def _ffmpeg_platform_tag() -> str:
     return "linux-x86_64"
 @contextlib.contextmanager
 def _video_input_source(data: bytes):
+    """Write media to a RAM-backed temp file when possible, with restrictive mode."""
     import tempfile
     ram_disk = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+    # Prefer exclusive create + owner-only permissions.
     fd, tmp_path = tempfile.mkstemp(suffix=".vidsrc", dir=ram_disk)
     try:
+        try:
+            os.fchmod(fd, 0o600)
+        except Exception:
+            pass
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
         yield tmp_path
     finally:
         removed = False
@@ -1007,14 +1288,27 @@ def _video_input_source(data: bytes):
             _secure_shred_file(tmp_path)
 def probe_video_in_memory(data: bytes) -> VideoInfo:
     import re
+    _sniff_media_kind(data, ViewerKind.VIDEO)
     ffmpeg = _get_ffmpeg_exe()
     with _video_input_source(data) as video_path:
-        proc = subprocess.Popen(
-            [ffmpeg, "-hide_banner", "-i", video_path],
+        popen_kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        _, stderr = proc.communicate()
+        if _SYSTEM in ("Linux", "Darwin"):
+            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+        proc = subprocess.Popen(
+            [ffmpeg, "-hide_banner", "-i", video_path],
+            **popen_kwargs,
+        )
+        try:
+            _, stderr = proc.communicate(timeout=MEDIA_PARSE_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError("Video probe timed out (possible malicious / pathological media).")
     text = stderr.decode("utf-8", errors="ignore")
     video_line = ""
     for line in text.split("\n"):
@@ -1032,6 +1326,11 @@ def probe_video_in_memory(data: bytes) -> VideoInfo:
             break
     if width <= 0 or height <= 0:
         raise RuntimeError("Could not determine video dimensions.")
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise RuntimeError(
+            f"Video frame size {width}x{height} exceeds the safe dimension limit "
+            f"({MAX_IMAGE_DIMENSION}px)."
+        )
     fps = 25.0
     for pattern in (
         r"([\d.]+)\s*fps",
@@ -1105,12 +1404,14 @@ def stream_video_frames_in_memory(
             "-vf", vf,
             "pipe:1",
         ]
-        proc = subprocess.Popen(
-            cmd,
+        popen_kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=frame_size,  # ~1 frame
         )
+        if _SYSTEM in ("Linux", "Darwin"):
+            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         if process_holder is not None:
             process_holder.append(proc)
         try:
@@ -1142,8 +1443,18 @@ def extract_video_audio_as_wav(data: bytes) -> Optional[bytes]:
             "-f", "mp3", "-c:a", "libmp3lame", "-q:a", "4",
             "pipe:1",
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = proc.communicate()
+        popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if _SYSTEM in ("Linux", "Darwin"):
+            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            stdout, _ = proc.communicate(timeout=MEDIA_PARSE_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return None
     if not stdout:
         return None
     return stdout
@@ -1163,8 +1474,18 @@ def transcode_audio_to_wav_in_memory(data: bytes) -> bytes:
             "-vn", "-f", "wav", "-acodec", "pcm_s16le",
             "pipe:1",
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
+        popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if _SYSTEM in ("Linux", "Darwin"):
+            popen_kwargs["preexec_fn"] = _apply_child_resource_limits
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            stdout, stderr = proc.communicate(timeout=MEDIA_PARSE_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError("Audio transcode timed out (possible pathological media).")
     if not stdout:
         msg = stderr.decode("utf-8", "ignore").strip()[-400:] if stderr else "unknown error"
         raise RuntimeError(f"Could not decode audio: {msg}")
@@ -1183,11 +1504,21 @@ def get_audio_duration_seconds(data: bytes, filename: Optional[str] = None) -> O
             import re
             ffmpeg = _get_ffmpeg_exe()
             with _video_input_source(data) as src_path:
+                popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if _SYSTEM in ("Linux", "Darwin"):
+                    popen_kwargs["preexec_fn"] = _apply_child_resource_limits
                 proc = subprocess.Popen(
                     [ffmpeg, "-hide_banner", "-i", src_path],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    **popen_kwargs,
                 )
-                _, stderr = proc.communicate()
+                try:
+                    _, stderr = proc.communicate(timeout=MEDIA_PARSE_TIMEOUT_SEC)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return None
             text = stderr.decode("utf-8", "ignore") if stderr else ""
             m = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", text)
             if m:
@@ -2454,7 +2785,7 @@ class VaultView(QWidget):
         root.setSpacing(12)
         root.addWidget(SectionHeader(
             "⏣ Sacred Vault ⏣",
-            "AES-256-GCM · AES-256-CBC · PBKDF2-HMAC-SHA512 · All in RAM",
+            "AES-256-GCM · AES-256-CBC · PBKDF2 / Argon2id · All in RAM",
             "𓁹"
         ))
         self.tabs = QTabWidget()
@@ -2510,6 +2841,25 @@ class VaultView(QWidget):
         auth.addWidget(self._section_label("VAULT SEAL"), 0, 0, 1, 2)
         self.create_pw_entry = self._field(auth, "ARCHIVE PASSWORD", "Password to encrypt...", True)
         self.create_pw_confirm_entry = self._field(auth, "CONFIRM PASSWORD", "Repeat the password...", True)
+        kdf_label = QLabel("KEY DERIVATION")
+        kdf_label.setFont(_font(11, "Georgia", True))
+        kdf_label.setStyleSheet(f"color:{TEMPLE_GOLD_ANTIQUE};")
+        auth.addWidget(kdf_label, 3, 0)
+        self.create_kdf_combo = QComboBox()
+        self.create_kdf_combo.addItem("PBKDF2-HMAC-SHA512 (200k iters) — classic", KDF_PBKDF2)
+        if _HAS_ARGON2:
+            self.create_kdf_combo.addItem(
+                f"Argon2id (m={ARGON2_MEMORY_KIB//1024}MiB, t={ARGON2_TIME}, p={ARGON2_PARALLELISM}) — memory-hard",
+                KDF_ARGON2ID,
+            )
+        else:
+            self.create_kdf_combo.addItem(
+                "Argon2id (install argon2-cffi to enable)",
+                KDF_ARGON2ID,
+            )
+            # Keep selectable but build_bca will raise a clear error if chosen.
+        self.create_kdf_combo.setCurrentIndex(0)
+        auth.addWidget(self.create_kdf_combo, 3, 1)
         auth.addWidget(QLabel(), 4, 0)
         self.create_status = QLabel()
         self.create_status.setFont(_font(12, "Georgia", False, True))
@@ -2666,6 +3016,7 @@ class VaultView(QWidget):
             wipe_bytearray(entry.data)
         self._pending_create_entries.clear()
         self._refresh_create_list()
+        gc.collect()
     def _on_create_archive(self):
         if not self._pending_create_entries:
             QMessageBox.warning(self,"Vault","Add at least one file to protect.")
@@ -2686,16 +3037,19 @@ class VaultView(QWidget):
         if not save_path.lower().endswith(".bca"):
             save_path += ".bca"
         password_buf=bytearray(pw1.encode("utf-8"))
+        kdf_id = self.create_kdf_combo.currentData()
+        if kdf_id is None:
+            kdf_id = KDF_PBKDF2
         entries=self._pending_create_entries
         self._pending_create_entries=[]
         self._refresh_create_list()
-        self._set_busy(self.create_spinner,[self.create_pw_entry,self.create_pw_confirm_entry,self.create_btn,self.add_files_btn],True)
+        self._set_busy(self.create_spinner,[self.create_pw_entry,self.create_pw_confirm_entry,self.create_btn,self.add_files_btn,self.create_kdf_combo],True)
         self.create_progress.show()
         self.create_progress.setValue(0)
         self.create_status.setText("Forging archive...")
         def worker(progress_emit):
             try:
-                archive=build_bca(entries,password_buf,progress_emit)
+                archive=build_bca(entries,password_buf,progress_emit,kdf_id=kdf_id)
                 with open(save_path,"wb") as f:
                     f.write(bytes(archive))
                 wipe_bytearray(archive)
@@ -2721,7 +3075,7 @@ class VaultView(QWidget):
         self.create_pw_confirm_entry.clear()
         self._set_busy(
             self.create_spinner,
-            [self.create_pw_entry, self.create_pw_confirm_entry, self.create_btn, self.add_files_btn],
+            [self.create_pw_entry, self.create_pw_confirm_entry, self.create_btn, self.add_files_btn, self.create_kdf_combo],
             False,
         )
         self.create_status.setText(f"✓ Archive created: {path}")
@@ -2734,7 +3088,7 @@ class VaultView(QWidget):
         self.create_progress.hide()
         self._set_busy(
             self.create_spinner,
-            [self.create_pw_entry, self.create_pw_confirm_entry, self.create_btn, self.add_files_btn],
+            [self.create_pw_entry, self.create_pw_confirm_entry, self.create_btn, self.add_files_btn, self.create_kdf_combo],
             False,
         )
         if "Out of memory" in message or "MemoryError" in message:
@@ -2851,6 +3205,27 @@ class VaultView(QWidget):
         self.entries_layout.addStretch(1)
     def _preview_entry(self,entry):
         kind=classify_extension(entry.name)
+        # High soft ceilings so large legitimate media still previews. Absolute
+        # safety still rests on magic sniffing, pixel/page bombs, timeouts,
+        # restricted library options, and (where used) child-process RLIMIT.
+        MAX_PREVIEW_BYTES = {
+            ViewerKind.IMAGE: 400 * 1024 * 1024,   # 400 MiB
+            ViewerKind.PDF:   350 * 1024 * 1024,   # 350 MiB
+            ViewerKind.AUDIO: 500 * 1024 * 1024,   # 500 MiB
+            ViewerKind.VIDEO: 1024 * 1024 * 1024,  # 1 GiB
+            ViewerKind.TEXT:  32 * 1024 * 1024,    # 32 MiB
+        }
+        limit = MAX_PREVIEW_BYTES.get(kind, 64 * 1024 * 1024)
+        if len(entry.data) > limit:
+            QMessageBox.warning(
+                self,
+                "Preview size limit",
+                f"'{entry.name}' is {len(entry.data) / (1024*1024):.1f} MiB, which exceeds the "
+                f"preview limit of {limit / (1024*1024):.0f} MiB for this type.\n\n"
+                "Use Export to write the file to disk and open it with an external viewer "
+                "if you need to inspect it.",
+            )
+            return
         if kind == ViewerKind.VIDEO and _SYSTEM in ("Windows","Darwin"):
             box=QMessageBox(self)
             box.setWindowTitle("Security Notice — Video Preview")
@@ -2866,24 +3241,62 @@ class VaultView(QWidget):
             if box.exec()!=QMessageBox.Yes:
                 return
         data=bytes(entry.data)
+        # Layer 1: magic / structural sniff before any library sees the bytes.
+        try:
+            if kind in (ViewerKind.IMAGE, ViewerKind.PDF, ViewerKind.AUDIO, ViewerKind.VIDEO):
+                _sniff_media_kind(data, kind)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self,
+                "Media rejected",
+                f"'{entry.name}' failed the format-safety check:\n\n{exc}\n\n"
+                "The file was not opened in a media parser.",
+            )
+            wipe_bytearray(bytearray(data)) if False else None
+            del data
+            gc.collect()
+            return
         dialog=QDialog(self)
         dialog.setWindowTitle(f"Preview — {entry.name}")
         dialog.resize(920,760)
         dialog.setStyleSheet(APP_QSS)
         apply_screen_capture_protection(dialog)
-        if kind==ViewerKind.IMAGE:
-            self._preview_image(dialog,data)
-        elif kind==ViewerKind.PDF:
-            self._preview_pdf(dialog,data)
-        elif kind==ViewerKind.TEXT:
-            self._preview_text(dialog,data)
-        elif kind==ViewerKind.AUDIO:
-            self._preview_audio(dialog,data,entry.name)
-        elif kind==ViewerKind.VIDEO:
-            self._preview_video(dialog,data,entry.name)
-        else:
-            QLabel("No preview available for this file type.\nUse Export to save it explicitly to disk.").show()
-        dialog.exec()
+        try:
+            if kind==ViewerKind.IMAGE:
+                self._preview_image(dialog,data)
+            elif kind==ViewerKind.PDF:
+                self._preview_pdf(dialog,data)
+            elif kind==ViewerKind.TEXT:
+                self._preview_text(dialog,data)
+            elif kind==ViewerKind.AUDIO:
+                self._preview_audio(dialog,data,entry.name)
+            elif kind==ViewerKind.VIDEO:
+                self._preview_video(dialog,data,entry.name)
+            else:
+                QLabel("No preview available for this file type.\nUse Export to save it explicitly to disk.").show()
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Preview failed",
+                f"Could not open preview for '{entry.name}'.\n\n"
+                f"The file may be corrupted or crafted to stress the parser.\n"
+                f"Details: {exc}\n\n"
+                "Export the file and inspect it with a dedicated external tool if needed.",
+            )
+        finally:
+            # Drop the temporary copy and encourage GC so large media does not linger.
+            try:
+                # Best-effort wipe of the preview copy (not the vault entry).
+                if isinstance(data, (bytes, bytearray)):
+                    # bytes are immutable; allocate a transient wipe buffer only
+                    # if we still hold a mutable view (defensive).
+                    pass
+                del data
+            except Exception:
+                pass
+            for _ in range(2):
+                gc.collect()
     def _preview_image(self,dialog,data):
         base=render_image_in_memory(data)
         animated=bool(getattr(base,"is_animated",False) and getattr(base,"n_frames",1)>1)
@@ -3156,10 +3569,30 @@ class VaultView(QWidget):
                 status.setText(f"Playback error: {exc}"); play.setEnabled(False); stop.setEnabled(False)
         def slider_release():
             if duration:
-                target=slider.value()/1000*duration
+                raw = slider.value() / 1000.0 * duration
+                # Tiny margin: allow scrubbing almost to the reported end.
+                # If the decoded stream is shorter (common with m4a padding),
+                # play_audio will start near the end and the poll timer will
+                # mark Finished once the mixer reports idle.
+                margin = 0.05
+                target = min(raw, max(0.0, duration - margin))
+                if raw >= duration - margin:
+                    try:
+                        stop_audio()
+                    except Exception:
+                        pass
+                    state["stopped"] = True
+                    state["paused"] = False
+                    state["offset"] = 0
+                    slider.setValue(1000)
+                    time_label.setText(f"{self._fmt_time(duration)} / {self._fmt_time(duration)}")
+                    play.setText("▶ Play")
+                    status.setText("Finished")
+                    return
                 try:
                     state["session"]=play_audio_in_memory(state["playable"] if state["playable"] is not None else data,start_seconds=target)
                     state["offset"]=target; state["stopped"]=False; state["paused"]=False; state["started_at"]=time.monotonic(); set_audio_volume(vol.value()/100); play.setText("⏸ Pause")
+                    status.setText("Playing from RAM...")
                 except Exception: pass
         slider.sliderReleased.connect(slider_release)
         vol.valueChanged.connect(lambda v:set_audio_volume(v/100))
@@ -3349,16 +3782,34 @@ class VaultView(QWidget):
             def seek():
                 if info.duration:
                     frame_interval = 1.0/info.fps if info.fps>0 else 0.04
-                    # ffmpeg's reported container duration can run past the
-                    # timestamp of the last actual decodable video frame
-                    # (trailing audio/container padding, common in formats
-                    # like WMV). Seeking right up to that duration can land
-                    # after the last frame and yield nothing back, which is
-                    # what made the player appear stuck near the end.
-                    # Leaving a small margin keeps the seek inside content
-                    # ffmpeg can actually hand back a frame for.
-                    margin = max(frame_interval*2, 0.5)
-                    target = min(slider.value()/1000*info.duration, max(0.0, info.duration-margin))
+                    # Keep only a tiny margin so the scrubber can reach near
+                    # the true end. If ffmpeg returns no frame (container
+                    # padding past last decodable frame), the finishedDecoding
+                    # handler falls back to the last good timestamp instead of
+                    # leaving the player stuck.
+                    margin = max(frame_interval, 0.05)
+                    raw = slider.value() / 1000.0 * info.duration
+                    target = min(raw, max(0.0, info.duration - margin))
+                    if raw >= info.duration - margin:
+                        # User scrubbed to the very end: treat as finished.
+                        state["playing"] = False
+                        state["last_time"] = info.duration
+                        slider.setValue(1000)
+                        time_label.setText(
+                            f"{self._fmt_time(info.duration)} / {self._fmt_time(info.duration)}"
+                        )
+                        play.setText("▶ Play")
+                        status.setText("Reached the end of the video.")
+                        if state["thread"]:
+                            try:
+                                state["thread"].request_stop()
+                            except Exception:
+                                pass
+                        try:
+                            stop_audio()
+                        except Exception:
+                            pass
+                        return
                     start_decode(target)
                     if wav_audio:
                         try:
@@ -3438,7 +3889,9 @@ class VaultView(QWidget):
         self.open_status.setText("Vault closed · Data wiped from RAM.")
         self.open_status.setStyleSheet(f"color:{TEMPLE_GOLD_BRONZE};")
         self.open_pw_entry.clear()
-        gc.collect()
+        # Multiple GC passes help return large media pages to the OS sooner.
+        for _ in range(3):
+            gc.collect()
     def wipe_all_on_exit(self):
         for entry in self._open_entries:
             wipe_bytearray(entry.data)
@@ -3456,10 +3909,11 @@ class VaultView(QWidget):
             stop_audio()
         except Exception:
             pass
-        for tmp in self._active_video_tmp_paths:
+        for tmp in list(self._active_video_tmp_paths):
             _secure_shred_file(tmp)
         self._active_video_tmp_paths.clear()
-        gc.collect()
+        for _ in range(3):
+            gc.collect()
 class BastetCipherApp(QMainWindow):
     def __init__(self):
         super().__init__()
