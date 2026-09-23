@@ -5,3 +5,4 @@ pymupdf>=1.24.0
 mutagen>=1.47.0
 pygame>=2.6.0
 imageio-ffmpeg>=0.5.1
+argon2-cffi>=25.1.0
