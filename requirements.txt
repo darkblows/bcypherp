@@ -7,3 +7,4 @@ pygame>=2.6.0
 imageio-ffmpeg>=0.5.1
 argon2-cffi>=25.1.0
 pyobjc>=10.0; sys_platform == "darwin"
+customtkinter>=5.2.2
