@@ -365,6 +365,93 @@ def argon2id_hex(password: str, salt_str: str, key_length: int = 64) -> str:
         type=Argon2Type.ID,
     )
     return derived.hex()
+_SHAKE_DOMAIN = "BastetCipher/Argon2id/v2/"
+_SHAKE_ALPHA_LOWER = "abcdefghijklmnopqrstuvwxyz"
+_SHAKE_ALPHA_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_SHAKE_DIGITS = "0123456789"
+_SHAKE_ALPHABET = _SHAKE_ALPHA_LOWER + _SHAKE_ALPHA_UPPER + _SHAKE_DIGITS + SPECIAL_CHARS
+_SHAKE_BODY_CORE_LEN = 128
+
+class _ShakeStream:
+    _CHUNK = 4096
+
+    def __init__(self, seed: bytes, label: str) -> None:
+        self._seed = bytes(seed)
+        self._label = (_SHAKE_DOMAIN + label).encode("utf-8")
+        self._buf = b""
+        self._pos = 0
+        self._counter = 0
+
+    def _refill(self) -> None:
+        h = hashlib.shake_256()
+        h.update(self._label)
+        h.update(b"\x00")
+        h.update(struct.pack("<Q", self._counter))
+        h.update(self._seed)
+        self._buf = h.digest(self._CHUNK)
+        self._pos = 0
+        self._counter += 1
+
+    def byte(self) -> int:
+        if self._pos >= len(self._buf):
+            self._refill()
+        b = self._buf[self._pos]
+        self._pos += 1
+        return b
+
+    def below(self, n: int) -> int:
+        if n <= 0:
+            raise ValueError("n must be positive")
+        if n == 1:
+            return 0
+        nbytes = (n.bit_length() + 7) // 8
+        space = 1 << (8 * nbytes)
+        limit = space - (space % n)
+        while True:
+            v = 0
+            for _ in range(nbytes):
+                v = (v << 8) | self.byte()
+            if v < limit:
+                return v % n
+
+def _shake_shuffle(items: list, stream: "_ShakeStream") -> None:
+    for i in range(len(items) - 1, 0, -1):
+        j = stream.below(i + 1)
+        items[i], items[j] = items[j], items[i]
+
+def shake256_password_body(derived_key: bytes, length: int = _SHAKE_BODY_CORE_LEN) -> str:
+    if length < 3:
+        raise ValueError("length must be at least 3")
+    stream = _ShakeStream(derived_key, "body")
+    n_special = 8 + stream.below(8)
+    core = _SHAKE_ALPHA_LOWER + _SHAKE_ALPHA_UPPER + _SHAKE_DIGITS
+    chars = [
+        _SHAKE_ALPHA_LOWER[stream.below(len(_SHAKE_ALPHA_LOWER))],
+        _SHAKE_ALPHA_UPPER[stream.below(len(_SHAKE_ALPHA_UPPER))],
+        _SHAKE_DIGITS[stream.below(len(_SHAKE_DIGITS))],
+    ]
+    while len(chars) < length:
+        chars.append(core[stream.below(len(core))])
+    chars += [SPECIAL_CHARS[stream.below(len(SPECIAL_CHARS))] for _ in range(n_special)]
+    _shake_shuffle(chars, stream)
+    return "".join(chars)
+
+def shake256_amplification(
+    input_str: str, pim: str, derived_key: bytes, amplifier: int
+) -> str:
+    if amplifier == 0:
+        return ""
+    seed = hashlib.sha512(
+        (
+            input_str + "\u00A7" + pim + "\u00A7" + str(amplifier) + "\u00A7" + PEPPER
+        ).encode("utf-8")
+        + b"\x00"
+        + bytes(derived_key)
+    ).digest()
+    stream = _ShakeStream(seed, "amp")
+    return "".join(_SHAKE_ALPHABET[stream.below(len(_SHAKE_ALPHABET))] for _ in range(amplifier))
+
+
 def _lcg_next(state: int) -> int:
     return (state * 1664525 + 1013904223) & MASK32
 def _js_parse_int_decimal(digits: str) -> int:
@@ -508,15 +595,22 @@ def run_cipher_pipeline(
         derived_key = pbkdf2_hex(combined + PEPPER, kdf_salt, iters, 64)
         kdf_name = "PBKDF2-HMAC-SHA512"
     progress(85, "Key derived. Inserting sacred glyphs...")
-    with_special = insert_special_chars(derived_key, seed)
-    with_case = apply_mixed_case(with_special, seed)
+    if kdf_id == KDF_ARGON2ID:
+        derived_bytes = bytes.fromhex(derived_key)
+        with_case = shake256_password_body(derived_bytes)
+    else:
+        with_special = insert_special_chars(derived_key, seed)
+        with_case = apply_mixed_case(with_special, seed)
     progress(
         97,
         f"Amplifying by {amplifier} sacred characters..."
         if amplifier > 0
         else "Sealing with Bastet's blessing...",
     )
-    amp_extension = generate_amplification(input_str, pim, derived_key, amplifier)
+    if kdf_id == KDF_ARGON2ID:
+        amp_extension = shake256_amplification(input_str, pim, derived_bytes, amplifier)
+    else:
+        amp_extension = generate_amplification(input_str, pim, derived_key, amplifier)
     progress(100, "Cipher completed.")
     final_cipher = ".," + with_case + amp_extension + ",."
     return CipherResult(
@@ -537,7 +631,8 @@ BCA_ITERS = 310_000
 BCA_ITERS_LEGACY = 200_000
 BCA_ITERS_MIN = 100_000
 BCA_ITERS_MAX = 5_000_000
-ARGON2_MEMORY_KIB = 64 * 1024  # 64 MiB
+ARGON2_MEMORY_KIB = 256 * 1024
+ARGON2_VAULT_MEMORY_KIB = 64 * 1024
 ARGON2_TIME = 3
 ARGON2_PARALLELISM = 4
 ARGON2_HASH_LEN = 64
@@ -589,7 +684,7 @@ def derive_vault_keys(
             secret=bytes(password),
             salt=salt,
             time_cost=ARGON2_TIME,
-            memory_cost=ARGON2_MEMORY_KIB,
+            memory_cost=ARGON2_VAULT_MEMORY_KIB,
             parallelism=ARGON2_PARALLELISM,
             hash_len=ARGON2_HASH_LEN,
             type=Argon2Type.ID,
