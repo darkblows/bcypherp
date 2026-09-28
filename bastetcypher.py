@@ -632,7 +632,8 @@ BCA_ITERS_LEGACY = 200_000
 BCA_ITERS_MIN = 100_000
 BCA_ITERS_MAX = 5_000_000
 ARGON2_MEMORY_KIB = 256 * 1024
-ARGON2_VAULT_MEMORY_KIB = 64 * 1024
+ARGON2_VAULT_MEMORY_KIB = 512 * 1024
+ARGON2_VAULT_MEMORY_LEGACY_KIB = 64 * 1024  # Argon2id vaults sealed before the 512 MiB bump
 ARGON2_TIME = 3
 ARGON2_PARALLELISM = 4
 ARGON2_HASH_LEN = 64
@@ -671,6 +672,7 @@ def derive_vault_keys(
     salt: bytes,
     iterations: int,
     kdf_id: int = KDF_PBKDF2,
+    memory_kib: Optional[int] = None,
 ) -> Tuple[bytearray, bytearray]:
     if kdf_id == KDF_ARGON2ID:
         if not _HAS_ARGON2:
@@ -684,7 +686,7 @@ def derive_vault_keys(
             secret=bytes(password),
             salt=salt,
             time_cost=ARGON2_TIME,
-            memory_cost=ARGON2_VAULT_MEMORY_KIB,
+            memory_cost=(memory_kib if memory_kib is not None else ARGON2_VAULT_MEMORY_KIB),
             parallelism=ARGON2_PARALLELISM,
             hash_len=ARGON2_HASH_LEN,
             type=Argon2Type.ID,
@@ -877,32 +879,54 @@ def parse_bca(
         raise BCAFormatError("Archive version not supported.")
     ct_view = memoryview(d)[ct_offset:]
     progress(10, "Re-deriving 512-bit keys...")
-    k1, k2 = derive_vault_keys(
-        password,
-        salt,
-        iterations if kdf_id == KDF_PBKDF2 else BCA_ITERS,
-        kdf_id=kdf_id,
+    _mem_tries: Tuple[Optional[int], ...] = (
+        (ARGON2_VAULT_MEMORY_KIB, ARGON2_VAULT_MEMORY_LEGACY_KIB)
+        if kdf_id == KDF_ARGON2ID
+        else (None,)
     )
+    k1: bytearray
+    k2: bytearray
     plain: Optional[bytearray] = None
     ct1: Optional[bytes] = None
+    _auth_err: Optional[BaseException] = None
+    for _mi, _mem_kib in enumerate(_mem_tries):
+        if _mi > 0:
+            wipe_bytearray(k1)
+            wipe_bytearray(k2)
+            progress(12, "Re-deriving (legacy vault parameters)...")
+        k1, k2 = derive_vault_keys(
+            password,
+            salt,
+            iterations if kdf_id == KDF_PBKDF2 else BCA_ITERS,
+            kdf_id=kdf_id,
+            memory_kib=_mem_kib,
+        )
+        try:
+            progress(30, "Layer 2 decryption...")
+            try:
+                ct1 = _aes_cbc_decrypt(bytes(k2), iv2, ct_view)
+            except BCADecryptError:
+                raise
+            except MemoryError:
+                raise
+            except Exception:
+                raise BCADecryptError(_BCA_AUTH_FAIL) from None
+            progress(45, "Layer 1 decryption...")
+            try:
+                aesgcm = AESGCM(bytes(k1))
+                plain = bytearray(aesgcm.decrypt(iv1, ct1, None))
+            except MemoryError:
+                raise
+            except Exception:
+                raise BCADecryptError(_BCA_AUTH_FAIL) from None
+            _auth_err = None
+            break
+        except BCADecryptError as _e:
+            _auth_err = _e
+            continue
+    if plain is None:
+        raise (_auth_err if _auth_err is not None else BCADecryptError(_BCA_AUTH_FAIL))
     try:
-        progress(30, "Layer 2 decryption...")
-        try:
-            ct1 = _aes_cbc_decrypt(bytes(k2), iv2, ct_view)
-        except BCADecryptError:
-            raise
-        except MemoryError:
-            raise
-        except Exception:
-            raise BCADecryptError(_BCA_AUTH_FAIL) from None
-        progress(45, "Layer 1 decryption...")
-        try:
-            aesgcm = AESGCM(bytes(k1))
-            plain = bytearray(aesgcm.decrypt(iv1, ct1, None))
-        except MemoryError:
-            raise
-        except Exception:
-            raise BCADecryptError(_BCA_AUTH_FAIL) from None
         del ct1
         ct1 = None
         progress(54, "Analyzing structure...")
